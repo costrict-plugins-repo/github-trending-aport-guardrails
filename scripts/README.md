@@ -1,0 +1,70 @@
+# Scripts
+
+## Submodules: ensure up to date before push
+
+### `ensure-submodules-updated.sh`
+
+Used by the pre-push hook. Ensures submodules are initialized and, with `--update-remote`, updated to the latest remote commit. Exits 1 if refs changed and are uncommitted (so you must commit submodule updates before pushing).
+
+```bash
+./scripts/ensure-submodules-updated.sh           # init only
+./scripts/ensure-submodules-updated.sh --update-remote   # init + fetch latest, fail if uncommitted
+```
+
+### Pre-push hook (runs on every push)
+
+Hooks live in **`scripts/git-hooks/`** and are used by Git so that **every `git push`** runs the submodule check.
+
+**One-time per clone:**
+
+```bash
+make install-git-hooks
+```
+
+This sets `git config core.hooksPath scripts/git-hooks`. Git then runs hooks from this directory (e.g. `pre-push`) on every push. No copy into `.git/hooks`—the committed hooks in the repo are used.
+
+After that, every push will:
+
+1. Run `git submodule update --init --recursive`
+2. Run `git submodule update --remote`
+3. If any submodule ref changed, block the push and tell you to commit the updated refs, then push again
+4. Run `scripts/pre-push-check.sh` for the fast local checks
+
+### `pre-push-check.sh`
+
+Runs fast, deterministic checks by default:
+
+- `jq` passport schema validation
+- shell syntax and `shfmt -d`
+- Codex provider tool-surface drift check against `openai/codex` using a persistent repo-and-ref-scoped local cache outside CI
+- evaluator API timeout parsing smoke test
+
+Full CI-equivalent local checks are opt-in with `APORT_PRE_PUSH_LEVEL=full`:
+
+- all fast checks
+- `shellcheck` when installed
+- `make test`
+- `npm run build`
+- `npm run test -w @aporthq/aport-agent-guardrails-core -w @aporthq/aport-agent-guardrails-langchain`
+- `node tests/frameworks/openclaw/setup.test.mjs`
+- `npm test` in `extensions/openclaw-aport`
+- isolated Python package builds + `twine check`
+- CrewAI, LangChain, and OpenClaw E2E flows using cached `/tmp` virtualenvs / temp homes
+
+Run it manually with:
+
+```bash
+npm run prepush:check
+npm run prepush:full
+```
+
+Useful environment flags:
+
+```bash
+APORT_SKIP_PRE_PUSH_CHECKS=1 git push          # skip hook checks once
+APORT_PRE_PUSH_INCLUDE_SHELLCHECK=1 npm run prepush:check  # add shellcheck to the fast gate
+APORT_PRE_PUSH_LEVEL=full npm run prepush:check  # run the CI-equivalent local gate
+APORT_CODEX_PROVIDER_SOURCE_DIR=/path/to/openai/codex npm run codex:tool-surface
+APORT_PRE_PUSH_INCLUDE_OPTIONAL=1 npm run prepush:check  # also run gitleaks / trufflehog if installed, including in fast mode
+APORT_PRE_PUSH_INCLUDE_OPENCLAW_LIVE=1 npm run prepush:check  # include the live OpenClaw CLI E2E step, including in fast mode
+```

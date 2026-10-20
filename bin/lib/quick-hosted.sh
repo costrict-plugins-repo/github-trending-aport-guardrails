@@ -1,0 +1,262 @@
+#!/usr/bin/env bash
+# Anonymous hosted passport issuance for quick-start installs.
+# Passport contents come from the server-side framework preset selected by framework.
+
+if ! command -v log_info > /dev/null 2>&1; then
+    _quick_hosted_lib_dir="$(cd "$(dirname "${BASH_SOURCE[0]:-.}")" && pwd)"
+    # shellcheck source=common.sh
+    source "$_quick_hosted_lib_dir/common.sh"
+fi
+if ! command -v validate_passport_selector_conflict > /dev/null 2>&1; then
+    _quick_hosted_lib_dir="${_quick_hosted_lib_dir:-$(cd "$(dirname "${BASH_SOURCE[0]:-.}")" && pwd)}"
+    # shellcheck source=guardrail-mode.sh
+    source "$_quick_hosted_lib_dir/guardrail-mode.sh"
+fi
+
+DEFAULT_APORT_ISSUE_URL="${DEFAULT_APORT_ISSUE_URL:-https://aport.id/api/issue}"
+
+aport_quick_hosted_git_email() {
+    if command -v git > /dev/null 2>&1; then
+        git config user.email 2> /dev/null || git config --global user.email 2> /dev/null || true
+    fi
+}
+
+aport_quick_hosted_mode_file_value() {
+    local file="$1"
+    local key="$2"
+    awk -F= -v k="$key" '
+$1 == k {
+  v = substr($0, length(k) + 2)
+  if (v ~ /^"[^"]*"$/ || v ~ /^\047[^\047]*\047$/) {
+    v = substr(v, 2, length(v) - 2)
+  }
+  print v
+  exit
+}
+' "$file"
+}
+
+aport_quick_hosted_is_valid_agent_id() {
+    if command -v is_aport_hosted_agent_id > /dev/null 2>&1; then
+        is_aport_hosted_agent_id "$1"
+        return $?
+    fi
+    [[ "${1:-}" =~ ^(ap|apt|agt_inst|agt_tmpl)_[A-Za-z0-9_-]+$ ]]
+}
+
+aport_hosted_passport_url() {
+    local agent_id="$1"
+    local app_url="${APORT_APP_URL:-https://aport.io}"
+    app_url="${app_url%/}"
+    printf '%s/passports?details=%s' "$app_url" "$agent_id"
+}
+
+aport_log_hosted_passport_reference() {
+    local agent_id="$1"
+    local mode_file="${2:-}"
+    log_info "Hosted passport: $(aport_hosted_passport_url "$agent_id")"
+    if [[ -n "$mode_file" ]]; then
+        log_info "Hosted config: $mode_file"
+    fi
+}
+
+aport_try_reuse_existing_hosted_config() {
+    local config_dir="$1"
+    local mode_file="$config_dir/aport/guardrail-mode.env"
+    [[ -r "$mode_file" ]] || return 1
+
+    local mode agent_id api_key api_url
+    mode="$(aport_quick_hosted_mode_file_value "$mode_file" "APORT_GUARDRAIL_MODE")"
+    agent_id="$(aport_quick_hosted_mode_file_value "$mode_file" "APORT_AGENT_ID")"
+    api_key="$(aport_quick_hosted_mode_file_value "$mode_file" "APORT_API_KEY")"
+    api_url="$(aport_quick_hosted_mode_file_value "$mode_file" "APORT_API_URL")"
+
+    [[ "$(printf '%s' "$mode" | tr '[:upper:]' '[:lower:]')" = "api" ]] || return 1
+    aport_quick_hosted_is_valid_agent_id "$agent_id" || return 1
+
+    export APORT_AGENT_ID="$agent_id"
+    if [[ -n "$api_key" ]]; then
+        export APORT_API_KEY="$api_key"
+    fi
+    if [[ -n "$api_url" ]]; then
+        export APORT_API_URL="$api_url"
+        export APORT_SELECTED_API_URL="$api_url"
+    fi
+    log_info "Found existing hosted passport in $mode_file"
+    aport_log_hosted_passport_reference "$agent_id" "$mode_file"
+    return 0
+}
+
+aport_quick_hosted_issue_passport() {
+    local framework="$1"
+    local config_dir="$2"
+    local noninteractive="${APORT_NONINTERACTIVE:-${CI:-}}"
+    local issue_url="${APORT_ISSUE_URL_CLI:-${APORT_ISSUE_URL:-$DEFAULT_APORT_ISSUE_URL}}"
+    local email="${APORT_OWNER_EMAIL_CLI:-${APORT_OWNER_EMAIL:-${APORT_EMAIL:-}}}"
+
+    if [[ -z "$email" && -z "$noninteractive" ]]; then
+        local detected_email
+        detected_email="$(aport_quick_hosted_git_email)"
+        read -r -p "  Email for passport claim${detected_email:+ [$detected_email]}: " email_input
+        email="${email_input:-$detected_email}"
+    fi
+
+    if [[ -z "$email" ]]; then
+        log_error "Hosted quick setup requires an email. Set APORT_OWNER_EMAIL or pass --email."
+        exit 1
+    fi
+
+    if ! command -v curl > /dev/null 2>&1; then
+        log_error "curl is required for hosted quick setup"
+        exit 1
+    fi
+    if ! command -v node > /dev/null 2>&1; then
+        log_error "node is required for hosted quick setup"
+        exit 1
+    fi
+
+    local payload response_file status body parsed agent_id api_key api_key_id
+    payload="$(node -e '
+const [framework, email] = process.argv.slice(1);
+process.stdout.write(JSON.stringify({
+  framework: [framework],
+  email,
+  showInGallery: false,
+}));
+' "$framework" "$email")"
+
+    response_file="$(mktemp "${TMPDIR:-/tmp}/aport-issue.XXXXXX")"
+    status="$(curl -sS -o "$response_file" -w "%{http_code}" \
+        -X POST "$issue_url" \
+        -H "Content-Type: application/json" \
+        --data "$payload")" || {
+        rm -f "$response_file"
+        log_error "Failed to reach APort issue endpoint: $issue_url"
+        exit 1
+    }
+    body="$(cat "$response_file")"
+    rm -f "$response_file"
+
+    if [[ ! "$status" =~ ^2 ]]; then
+        log_error "APort issue endpoint failed with HTTP $status: $body"
+        exit 1
+    fi
+
+    parsed="$(node -e '
+try {
+  const data = JSON.parse(process.argv[1] || "{}");
+  if (!data.agent_id || !data.api_key) process.exit(2);
+  process.stdout.write(`${data.agent_id}\t${data.api_key}\t${data.api_key_id || ""}`);
+} catch {
+  process.exit(2);
+}
+' "$body")" || {
+        log_error "APort issue endpoint returned an invalid quick setup response"
+        exit 1
+    }
+
+    IFS=$'\t' read -r agent_id api_key api_key_id <<< "$parsed"
+    if [[ -z "$agent_id" || -z "$api_key" ]]; then
+        log_error "APort issue endpoint did not return agent_id and api_key"
+        exit 1
+    fi
+
+    mkdir -p "$config_dir/aport"
+    export APORT_AGENT_ID="$agent_id"
+    export APORT_API_KEY="$api_key"
+    export APORT_SELECTED_GUARDRAIL_MODE="api"
+    log_info "Created hosted passport: $agent_id${api_key_id:+ (setup key: $api_key_id)}"
+    aport_log_hosted_passport_reference "$agent_id" ""
+}
+
+aport_maybe_configure_hosted_passport() {
+    local framework="$1"
+    local config_dir="$2"
+    local noninteractive="${APORT_NONINTERACTIVE:-${CI:-}}"
+    local selected_mode="${APORT_GUARDRAIL_MODE_CLI:-${APORT_GUARDRAIL_MODE:-}}"
+
+    local selected_mode_lower
+    selected_mode_lower="$(printf '%s' "$selected_mode" | tr '[:upper:]' '[:lower:]')"
+    local requested_reuse="${APORT_REUSE_PASSPORT_FROM_CLI:-${APORT_REUSE_PASSPORT_FROM:-}}"
+    if command -v validate_passport_selector_conflict > /dev/null 2>&1; then
+        validate_passport_selector_conflict || exit 1
+    fi
+
+    if [[ "$selected_mode_lower" = "local" ]]; then
+        # Local mode still benefits from an existing local passport on this device; hosted entries are not offered.
+        # Nothing reused (return 1) means the wizard runs next; an explicit request that cannot be honoured exits
+        # inside the callee, and that exit is not caught here.
+        if aport_maybe_reuse_device_passport "$framework" "$config_dir" local; then :; fi
+        return 1
+    fi
+
+    # Precedence: an explicit --reuse-from beats an agent id inherited from the environment and beats this
+    # framework's own saved config, so a stale or rotated key can be replaced from another install without a reset.
+    if [[ -z "$requested_reuse" ]]; then
+        if [[ -n "${APORT_HOSTED_AGENT_ID_CLI:-}" ]]; then
+            export APORT_AGENT_ID="$APORT_HOSTED_AGENT_ID_CLI"
+            return 0
+        fi
+        [[ -n "${APORT_AGENT_ID:-}" ]] && return 0
+        aport_try_reuse_existing_hosted_config "$config_dir" && return 0
+    fi
+
+    # A passport another framework already has on this device: the explicit request, or a menu before creating a
+    # new one. Hosted reuse configures APORT_AGENT_ID (return 0). Local reuse copies the file and sets
+    # APORT_PASSPORT_REUSED so the caller skips the wizard (return 1 keeps the caller on its local path).
+    if aport_maybe_reuse_device_passport "$framework" "$config_dir"; then
+        [[ -n "${APORT_AGENT_ID:-}" ]] && return 0
+        return 1
+    fi
+
+    if [[ -n "$noninteractive" ]]; then
+        if [[ -n "${APORT_QUICK_HOSTED_CLI:-${APORT_QUICK_HOSTED:-}}" || -n "${APORT_OWNER_EMAIL_CLI:-${APORT_OWNER_EMAIL:-${APORT_EMAIL:-}}}" ]]; then
+            aport_quick_hosted_issue_passport "$framework" "$config_dir"
+            return 0
+        fi
+        return 1
+    fi
+
+    echo ""
+    echo "  Passport setup:"
+    echo "    1. Create hosted APort passport now (recommended)"
+    echo "    2. Use existing hosted passport ID"
+    echo "    3. Create local passport file"
+    echo ""
+    read -r -p "  Choice [1/2/3]: " passport_choice
+    passport_choice="${passport_choice:-1}"
+
+    case "$passport_choice" in
+        1)
+            aport_quick_hosted_issue_passport "$framework" "$config_dir"
+            return 0
+            ;;
+        2)
+            local agent_id_input api_key_input
+            read -r -p "  Enter hosted agent_id from aport.io: " agent_id_input
+            if ! aport_quick_hosted_is_valid_agent_id "$agent_id_input"; then
+                log_error "Invalid agent_id format. Expected ap_..., apt_..., agt_inst_..., or agt_tmpl_..."
+                exit 1
+            fi
+            export APORT_AGENT_ID="$agent_id_input"
+            aport_log_hosted_passport_reference "$agent_id_input" ""
+            read -r -s -p "  APort setup API key [optional]: " api_key_input
+            echo ""
+            if [[ -n "$api_key_input" ]]; then
+                export APORT_API_KEY="$api_key_input"
+            fi
+            return 0
+            ;;
+        3)
+            return 1
+            ;;
+        *)
+            log_error "Invalid choice: $passport_choice"
+            exit 1
+            ;;
+    esac
+}
+
+# Passport reuse needs aport_quick_hosted_mode_file_value and aport_quick_hosted_is_valid_agent_id from above.
+# shellcheck source=passport-reuse.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]:-.}")" && pwd)/passport-reuse.sh"

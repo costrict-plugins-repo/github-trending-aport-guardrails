@@ -1,0 +1,47 @@
+#!/usr/bin/env bash
+# APort generic device uninstall — macOS, Linux, and Windows (via Node.js).
+
+set -euo pipefail
+
+# ==============================================================================
+# APORT DEVICE UNINSTALL - EDIT THIS SECTION ONLY
+# ==============================================================================
+#
+# Required values:
+#
+#   Variable             Example / Allowed values
+#   -------------------  --------------------------------------------------------
+#   APORT_FRAMEWORK      claude-code | cursor | openclaw | langchain | crewai |
+#                        deerflow | n8n
+#
+# Optional values:
+#
+#   Variable             Default
+#   -------------------  --------------------------------------------------------
+#   APORT_TARGET_USER    interactive user on the device
+#   APORT_TARGET_HOME    user profile / home directory
+#
+# ==============================================================================
+
+export APORT_FRAMEWORK="${APORT_FRAMEWORK:-claude-code}"
+export APORT_TARGET_USER="${APORT_TARGET_USER:-}"
+export APORT_TARGET_HOME="${APORT_TARGET_HOME:-}"
+
+# ==============================================================================
+# NO CHANGES NEEDED BELOW THIS LINE
+# ==============================================================================
+
+if [ -z "${BASH_SOURCE[0]+x}" ] || [ "${BASH_SOURCE[0]}" = "bash" ]; then
+    printf '%s\n' \
+        '[aport-device] ERROR: This file is not safe for "curl | bash".' \
+        '[aport-device] Use the bundled release script instead, e.g.:' \
+        '  curl -fsSL https://api.aport.io/enterprise/scripts/uninstall | bash' \
+        '[aport-device] Or save the bundled script and run: bash aport-device-uninstall.bundled.sh' >&2
+    exit 1
+fi
+
+_APORT_SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=enterprise-scripts/aport-device-lib.sh
+. "$_APORT_SCRIPT_DIR/aport-device-lib.sh"
+
+aport_device_invoke uninstall

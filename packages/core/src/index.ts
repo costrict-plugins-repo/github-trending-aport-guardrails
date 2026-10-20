@@ -1,0 +1,18 @@
+/**
+ * @aporthq/aport-agent-guardrails-core
+ * Main CLI entry point and exports for shared evaluator, passport, config.
+ */
+
+export { Evaluator, toolToPackId } from './core/evaluator.js';
+export type { Decision, ToolContext, VerifyRequest, VerifyResponse } from './core/evaluator.js';
+export { loadPassport, validatePassport } from './core/passport.js';
+export type { Passport } from './core/passport.js';
+export { loadConfig, writeConfig, findConfigPath } from './core/config.js';
+export type { Config } from './core/config.js';
+export { logDecision, resolveAuditLogPath, extractContextSummary } from './core/auditLogger.js';
+export type { AuditEntry } from './core/auditLogger.js';
+export { HARD_FAILURE_CODES, isHardFailureDecision, normalizeEnforcementMode, primaryReasonCode, shouldAllowDeniedDecision } from './core/enforcement.js';
+export type { EnforcementDecision, RuntimeEnforcementMode } from './core/enforcement.js';
+export { BaseAdapter } from './frameworks/base.js';
+export { OAPGuardrailProvider } from './providers/oap-guardrail-provider.js';
+export type { OAPGuardrailProviderConfig, GuardrailRequest, GuardrailReason, GuardrailDecision } from './providers/oap-guardrail-provider.js';

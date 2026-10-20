@@ -1,0 +1,48 @@
+# OpenClaw Agent Configuration
+
+<!-- This block is auto-installed by `make openclaw-setup` into workspace/AGENTS.md. It instructs the agent to call the guardrail before effectful actions. That is best-effort (LLM may not follow). Deterministic enforcement requires OpenClaw to call the guardrail via a before_tool_call hook or core integration; see docs/OPENCLAW_COMPATIBILITY.md and docs/APORT_OPENCLAW_INTEGRATION_PROPOSAL.md. -->
+
+## Pre-Action Authorization (APort Guardrails) ✅ REQUIRED
+
+**CRITICAL RULE**: Before executing ANY tool that has side effects, you MUST verify authorization through APort Agent Guardrails.
+
+### Required Steps (in order):
+
+1. **Check Passport Status** (guardrail does this first; passport is source of truth)
+   - The guardrail checks passport `status` before any policy. If `status` is not `active` (e.g. `suspended` or `revoked`), it denies with `oap.passport_suspended`. No separate kill-switch file.
+
+2. **Call APort Verification**
+   - Run: `~/.openclaw/.skills/aport-guardrail.sh <tool_name> '<context_json>'`
+   - Context JSON should include: tool parameters, resource identifiers, operation details
+
+3. **Read Decision**
+   - Read `~/.openclaw/decision.json`
+   - If `allow: false`: **STOP EXECUTION**, return denial reasons to user
+   - If `allow: true`: Proceed with tool execution, log receipt ID
+
+4. **Failure Behavior**
+   - APort script fails: DENY (fail-closed for security)
+   - Passport invalid: DENY with clear error message
+
+5. **Never reuse a previous decision**
+   - **Always invoke the tool** when the user requests an action. Do not skip or assume a tool will be denied because a previous invocation was denied.
+   - APort is re-evaluated on every tool call; passport or limits may have changed. When using the APort plugin, it never reuses a cached decision—each call gets a fresh verify.
+
+---
+
+## Effectful Tools (Require Verification)
+
+- **Git Operations**: `git.create_pr`, `git.merge`, `git.push`
+- **System Commands**: `exec.run`, `exec.*`, `system.*`
+- **Messaging**: `message.send`, `messaging.*`
+- **Data Operations**: `database.write`, `data.export`
+
+## Limits to Remember
+
+- The shell policy checks only the command text: `allowed_commands` is a prefix match; `blocked_patterns` uses word-boundary and glob matching, case-insensitive: a single word such as `sudo` matches only as a whole word (it does not block `sudoku`), an entry containing `*` or `?` is a glob, and a multi-word entry such as `rm -rf` matches as written; when `allowed_commands` is restrictive (not `*`), a command containing an unquoted `&&`, `||`, `;`, `|`, `&`, newline, `(`, `)`, `$(`, `<(`, `>(`, a `#` comment or `$'...'` quoting is denied with `oap.command_chain_unsupported`. It does not see what `git push`, `cat`, `curl` or a `>` redirect touch. Do not treat a shell allow as proof that a file, domain or branch rule was satisfied.
+- Reads of `.env` and anything starting with `.env`, the `.ssh`, `.aws`, `.gnupg` and `.kube` directories, `id_rsa`, `id_dsa`, `id_ecdsa` and `id_ed25519` anywhere in the path, files ending in `.pem` or `.key`, and any path containing `credentials` or `password` are always denied (case-insensitive). Other `id_*` names such as `id_token` are not on the list. Other secret files are denied only if listed in `limits["data.file.read"].blocked_patterns` (substring match). Writes have no built-in list; use `limits["data.file.write"].blocked_paths` (path prefix).
+- A passport that sets `limits["system.command.execute"].max_execution_time` denies shell calls that carry no timeout and have no harness default (`oap.missing_required_context`). Claude Code Bash defaults to 120 s and Codex `shell` to 10 s; Cursor, Gemini CLI, Goose, Codex `exec_command` and background calls are unbounded. Drop the limit or use a bounded tool.
+- Spawning sessions or sub-agents needs the `agent.session.create` capability in the passport; otherwise the call is denied with `oap.unknown_capability`.
+- The config directory may not be `~/.openclaw`. Use the paths the installer printed, or `OPENCLAW_CONFIG_DIR` / `APORT_OPENCLAW_CONFIG_DIR` when set.
+
+See full documentation: https://github.com/aporthq/aport-agent-guardrails

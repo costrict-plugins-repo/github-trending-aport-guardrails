@@ -1,0 +1,103 @@
+{
+  "name": "@aporthq/aport-agent-guardrails",
+  "version": "1.0.36",
+  "description": "APort Repository Guard and pre-action authorization guardrails for GitHub, Claude Code, Cursor, Codex, Gemini CLI, Goose, OpenClaw, LangChain, CrewAI, DeerFlow, and n8n",
+  "workspaces": [
+    "packages/*",
+    "extensions/openclaw-aport"
+  ],
+  "bin": {
+    "aport-agent-guardrails": "./bin/agent-guardrails",
+    "agent-guardrails": "./bin/agent-guardrails",
+    "aport": "./bin/openclaw",
+    "aport-guardrail": "./bin/aport-guardrail.sh"
+  },
+  "scripts": {
+    "test": "make test",
+    "install": "([ -f Makefile ] && make install) || true",
+    "server": "node src/server/index.js",
+    "dev": "node --watch src/server/index.js",
+    "sync-submodules": "git submodule update --init --recursive",
+    "sync-submodules:latest": "git submodule update --init --remote --recursive",
+    "changeset": "changeset",
+    "version": "node scripts/normalize-changeset-bumps.mjs && CI=1 changeset version && node scripts/sync-version.mjs",
+    "sync-version": "node scripts/sync-version.mjs",
+    "prepush:check": "bash scripts/pre-push-check.sh",
+    "prepush:full": "APORT_PRE_PUSH_LEVEL=full bash scripts/pre-push-check.sh",
+    "build": "npm run build:core && npm run build --workspaces --if-present",
+    "build:core": "npm run build -w @aporthq/aport-agent-guardrails-core",
+    "codex:tool-surface": "bash scripts/check-codex-provider-tool-surface.sh",
+    "local-codex-review": "bash scripts/local-codex-review.sh",
+    "local-pr-audit": "npm run prepush:check",
+    "local-pr-review": "npm run local-codex-review",
+    "local-pr-gate": "npm run local-pr-audit && npm run local-pr-review",
+    "release:version": "npm run version",
+    "prepublishOnly": "npm run build 2>/dev/null || true"
+  },
+  "keywords": [
+    "openclaw",
+    "github-actions",
+    "repository-guard",
+    "claude-code",
+    "cursor",
+    "codex",
+    "gemini-cli",
+    "goose",
+    "ironclaw",
+    "aport",
+    "agent",
+    "security",
+    "authorization",
+    "policy",
+    "guardrails",
+    "pre-action",
+    "ai-agent"
+  ],
+  "author": "APort Technologies Inc.",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/aporthq/aport-agent-guardrails.git"
+  },
+  "files": [
+    "bin/",
+    "python/aport_guardrails/core/tool-pack-mapping.json",
+    "src/",
+    "extensions/openclaw-aport/CHANGELOG.md",
+    "extensions/openclaw-aport/MIGRATION.md",
+    "extensions/openclaw-aport/README.md",
+    "extensions/openclaw-aport/api-client.js",
+    "extensions/openclaw-aport/audit.js",
+    "extensions/openclaw-aport/decision.js",
+    "extensions/openclaw-aport/enforcement.js",
+    "extensions/openclaw-aport/index.js",
+    "extensions/openclaw-aport/local-evaluator.js",
+    "extensions/openclaw-aport/openclaw-aport.js",
+    "extensions/openclaw-aport/openclaw.plugin.json",
+    "extensions/openclaw-aport/package.json",
+    "extensions/openclaw-aport/tool-mapping.js",
+    "external/",
+    "local-overrides/",
+    "templates/",
+    "skills/",
+    "docs/*.md",
+    "docs/assets/",
+    "docs/development/",
+    "docs/frameworks/",
+    "docs/operations/",
+    "docs/reviews/",
+    "LICENSE",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "devDependencies": {
+    "@changesets/cli": "^2.27.0",
+    "@types/node": "^20.0.0",
+    "typescript": "^5.0.0"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}

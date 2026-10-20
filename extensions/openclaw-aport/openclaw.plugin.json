@@ -1,0 +1,79 @@
+{
+  "id": "openclaw-aport",
+  "name": "APort Guardrails",
+  "description": "Deterministic pre-action authorization via APort policy enforcement. Registers before_tool_call to block disallowed tools.",
+  "version": "1.0.36",
+  "activation": {
+    "onStartup": true,
+    "onCapabilities": [
+      "hook"
+    ]
+  },
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "mode": {
+        "type": "string",
+        "enum": [
+          "local",
+          "api"
+        ],
+        "default": "local",
+        "description": "local = built-in JS evaluator, api = APort API"
+      },
+      "passportFile": {
+        "type": "string",
+        "default": "~/.openclaw/aport/passport.json",
+        "description": "Path to passport JSON"
+      },
+      "guardrailScript": {
+        "type": "string",
+        "default": "~/.openclaw/.skills/aport-guardrail-bash.sh",
+        "description": "Legacy compatibility field for manual smoke tests and shell tooling. Current plugin versions use the built-in JS local evaluator in local mode."
+      },
+      "apiUrl": {
+        "type": "string",
+        "description": "APort API base URL (api mode)"
+      },
+      "apiKey": {
+        "type": "string",
+        "description": "Optional API key for hosted verification mode. Configure it directly in plugin config if needed."
+      },
+      "failClosed": {
+        "type": "boolean",
+        "default": true,
+        "description": "Block tool on guardrail error when true"
+      },
+      "enforcementMode": {
+        "type": "string",
+        "enum": [
+          "enforce",
+          "warn",
+          "observe"
+        ],
+        "default": "enforce",
+        "description": "enforce blocks denied actions; warn records completed policy denials but allows execution; observe allows policy denials plus APort mapping/runtime/API failures with warnings for adoption-only rollout."
+      },
+      "allowUnmappedTools": {
+        "type": "boolean",
+        "default": false,
+        "description": "If true, allow tools with no policy mapping (custom skills, ClawHub, etc.). Default false blocks unmapped tools for fail-closed security."
+      },
+      "agentId": {
+        "type": "string",
+        "description": "Optional hosted passport ID from aport.io (API fetches passport)"
+      },
+      "alwaysVerifyEachToolCall": {
+        "type": "boolean",
+        "default": true,
+        "description": "Deprecated compatibility field. Current plugin versions always verify each tool call and ignore this setting."
+      },
+      "mapExecToPolicy": {
+        "type": "boolean",
+        "default": true,
+        "description": "Map exec tool to system.command.execute policy"
+      }
+    }
+  }
+}

@@ -1,0 +1,440 @@
+#!/bin/bash
+# validation.sh - Input validation functions for security
+# Used to prevent command injection, path traversal, and other injection attacks
+
+# Validate command string for dangerous injection patterns.
+# Returns 0 if safe, 1 if contains dangerous patterns.
+# NOTE: Pipes (|), chains (&&/||), redirects (>), and variable refs ($) are legitimate
+# shell syntax used by Claude Code, Cursor, and other AI tools. We block dangerous
+# OPERATIONS (handled by built-in security patterns and blocked_patterns in the evaluator),
+# not normal shell syntax. This function catches injection-specific patterns only.
+validate_command_string() {
+    local cmd="$1"
+
+    # Block backtick command substitution (injection vector; $() is caught by patterns below)
+    if echo "$cmd" | grep -qF '`'; then
+        return 1
+    fi
+
+    # Block $( ) command substitution containing dangerous commands
+    if echo "$cmd" | grep -qE '\$\([^)]*\b(rm|dd|mkfs|curl|wget|chmod|chown|sudo|kill|nc|netcat)\b'; then
+        return 1
+    fi
+
+    # Block null bytes (string termination attack)
+    if printf '%s' "$cmd" | grep -qP '\x00' 2> /dev/null; then
+        return 1
+    fi
+
+    # Block control characters (except tab/newline which are normal in shell)
+    if printf '%s' "$cmd" | grep -qP '[\x01-\x08\x0e-\x1f]' 2> /dev/null; then
+        return 1
+    fi
+
+    return 0
+}
+
+# Validate tool name contains only safe characters
+# Returns 0 if valid, 1 if invalid
+# Valid pattern: alphanumeric, dot, underscore, hyphen
+validate_tool_name() {
+    local tool_name="$1"
+
+    # Check for empty
+    if [ -z "$tool_name" ]; then
+        return 1
+    fi
+
+    # Check length (max 128 characters)
+    if [ ${#tool_name} -gt 128 ]; then
+        return 1
+    fi
+
+    # Check pattern: only alphanumeric, dot, underscore, hyphen
+    if ! echo "$tool_name" | grep -qE '^[a-zA-Z0-9._-]+$'; then
+        return 1
+    fi
+
+    return 0
+}
+
+# Validate explicit operator-provided passport paths.
+# Returns 0 if the path is hygienic, 1 if it contains dangerous constructs.
+validate_explicit_passport_path() {
+    local path="$1"
+
+    # Check for empty
+    if [ -z "$path" ]; then
+        return 1
+    fi
+
+    # Check for path traversal attempts
+    if echo "$path" | grep -qE '\.\./|/\.\./|/\.\.$'; then
+        return 1
+    fi
+
+    return 0
+}
+
+# Validate auto-discovered/default passport paths against trusted framework dirs.
+# Returns 0 if safe, 1 if potentially dangerous.
+validate_passport_path() {
+    local path="$1"
+
+    if ! validate_explicit_passport_path "$path"; then
+        return 1
+    fi
+
+    # Expand to absolute path
+    local abs_path
+    abs_path=$(readlink -f "$path" 2> /dev/null || realpath "$path" 2> /dev/null || echo "$path")
+
+    # Allowed base directories for auto-discovery
+    local allowed_bases=(
+        "$HOME/.openclaw"
+        "$HOME/.aport"
+        "$HOME/.claude"
+        "$HOME/.cursor"
+        "$HOME/.codex"
+        "$HOME/.gemini"
+        "$HOME/.config/opencode"
+        "$HOME/.n8n"
+        "/tmp/aport-"
+    )
+
+    local is_allowed=false
+    for base in "${allowed_bases[@]}"; do
+        case "$abs_path" in
+            "$base"*)
+                is_allowed=true
+                break
+                ;;
+            "/private$base"*)
+                is_allowed=true
+                break
+                ;;
+        esac
+    done
+
+    if [ "$is_allowed" = false ]; then
+        return 1
+    fi
+
+    return 0
+}
+
+# Validate JSON structure doesn't exceed size limits
+# Returns 0 if valid, 1 if too large or invalid
+validate_json_size() {
+    local json="$1"
+    local max_bytes="${2:-102400}" # Default: 100KB
+
+    # Check size
+    local size=${#json}
+    if [ "$size" -gt "$max_bytes" ]; then
+        return 1
+    fi
+
+    # Basic JSON syntax check (can be parsed by jq)
+    if ! echo "$json" | jq empty 2> /dev/null; then
+        return 1
+    fi
+
+    return 0
+}
+
+# Validate agent ID format
+# Returns 0 if valid, 1 if invalid
+validate_agent_id() {
+    local agent_id="$1"
+
+    # Check for empty
+    if [ -z "$agent_id" ]; then
+        return 1
+    fi
+
+    # Check length (max 128 characters)
+    if [ ${#agent_id} -gt 128 ]; then
+        return 1
+    fi
+
+    # Check pattern: ap_ prefix followed by alphanumeric/underscore
+    if ! echo "$agent_id" | grep -qE '^ap_[a-zA-Z0-9_]+$'; then
+        return 1
+    fi
+
+    return 0
+}
+
+# Safe pattern matching for blocked patterns.
+# Returns 0 if pattern matches, 1 if no match.
+# Usage: safe_pattern_match "string" "pattern"
+#
+# Matching strategy:
+# - Multi-word patterns (e.g. "rm -rf"): substring match (grep -F)
+#   because word boundary alone would miss "rm -rf /"
+# - Glob patterns (contain *, ?, **): converted to regex using glob_to_regex,
+#   so config like ".env*", "*credentials*", "**/.ssh/**" actually match.
+# - Plain single-word patterns (e.g. "sudo"): word boundary match
+#   to avoid false positives like "test_sudo_check" or "pseudocode".
+#
+# Prior implementation escaped '*' to '\*' (literal asterisk in ERE),
+# silently breaking every glob pattern in DEFAULT_BLOCKED_PATTERNS such as
+# ".env*", "*credentials*", "**/.aws/**". This made the supposed defaults
+# inert. The glob branch below restores intent.
+safe_pattern_match() {
+    local string="$1"
+    local pattern="$2"
+
+    # Multi-word substring patterns (e.g. "rm -rf"): unchanged behavior.
+    if [[ "$pattern" == *" "* ]] && [[ "$pattern" != *"*"* ]] && [[ "$pattern" != *"?"* ]]; then
+        echo "$string" | grep -qiF "$pattern"
+        return $?
+    fi
+
+    # Glob patterns: convert to regex and substring-match (no word boundary,
+    # because globs like "*credentials*" inherently match within tokens).
+    if [[ "$pattern" == *"*"* ]] || [[ "$pattern" == *"?"* ]]; then
+        local regex
+        regex="$(glob_to_regex "$pattern")"
+        echo "$string" | grep -qiE "$regex"
+        return $?
+    fi
+
+    # Plain single-word patterns (e.g. "sudo"): boundary-aware match.
+    # Escape regex metacharacters EXCEPT we've already excluded * and ?.
+    local pattern_escaped
+    pattern_escaped="$(printf '%s' "$pattern" | sed -E 's/[][(){}.^$+|\\-]/\\&/g')"
+    echo "$string" | grep -qiE "(^|[^[:alnum:]_])${pattern_escaped}([^[:alnum:]_]|$)"
+}
+
+# Convert a glob pattern (with * ** ?) to an extended-regex pattern.
+# Rules:
+#   ** -> .*    (matches any path including slashes)
+#   *  -> [^/]* (matches anything except path separator)
+#   ?  -> .     (single char)
+# Other regex metacharacters are escaped so the pattern matches literally.
+glob_to_regex() {
+    local g="$1"
+    # First escape regex metachars EXCEPT *, ?, /
+    local out
+    out="$(printf '%s' "$g" | sed -E 's/[][(){}.^$+|\\-]/\\&/g')"
+    # Replace ** with a sentinel, then *, then restore sentinel as .*
+    out="${out//\*\*/__APORT_GLOBSTAR__}"
+    out="${out//\*/[^/]*}"
+    out="${out//__APORT_GLOBSTAR__/.*}"
+    out="${out//\?/.}"
+    printf '%s' "$out"
+}
+
+# Safe prefix matching (for allowed commands)
+# Returns 0 if string starts with prefix at a shell-token boundary, 1 otherwise.
+safe_prefix_match() {
+    local string="$1"
+    local prefix="$2"
+    local remainder first
+
+    # Handle wildcard case
+    if [ "$prefix" = "*" ]; then
+        return 0
+    fi
+
+    remainder="${string#"$prefix"}"
+    [ "$remainder" != "$string" ] || return 1
+    [ -z "$remainder" ] && return 0
+    case "$prefix" in
+        *[[:space:]]) return 0 ;;
+    esac
+
+    first="${remainder:0:1}"
+    case "$first" in
+        [[:space:]]) return 0 ;;
+    esac
+
+    return 1
+}
+
+# Detect shell syntax that creates additional executable segments.
+# This is intentionally syntax-aware enough to ignore quoted JSON/strings while
+# rejecting unquoted chains that a single allowed-command prefix cannot cover.
+shell_command_has_unquoted_control_operator() {
+    local input="$1"
+    local quote=""
+    local escaped=0
+    local i ch next
+
+    for ((i = 0; i < ${#input}; i++)); do
+        ch="${input:i:1}"
+
+        if [ "$escaped" -eq 1 ]; then
+            escaped=0
+            continue
+        fi
+
+        if [ "$ch" = "\\" ] && [ "$quote" != "'" ]; then
+            escaped=1
+            continue
+        fi
+
+        # Bash ANSI-C / locale strings can contain escaped quotes that change
+        # how later control operators are parsed. The local guard does not need
+        # to emulate the shell; reject this syntax under restrictive allowlists.
+        if [ "$quote" != "'" ] && [ "$ch" = "$" ]; then
+            next="${input:i+1:1}"
+            case "$next" in
+                "(") return 0 ;;
+            esac
+            if [ -z "$quote" ]; then
+                case "$next" in
+                    "'" | '"') return 0 ;;
+                esac
+            fi
+        fi
+
+        if [ "$quote" = "'" ]; then
+            [ "$ch" = "$quote" ] && quote=""
+            continue
+        fi
+
+        if [ -n "$quote" ]; then
+            [ "$ch" = "$quote" ] && quote=""
+            continue
+        fi
+
+        case "$ch" in
+            '#')
+                # Shell comments can hide a later newline-separated command.
+                # Under restrictive allowlists we reject them instead of trying
+                # to emulate every shell parsing edge case.
+                if [ "$i" -eq 0 ] || [[ "${input:i-1:1}" =~ [[:space:]] ]]; then
+                    return 0
+                fi
+                ;;
+            "'" | '"')
+                quote="$ch"
+                ;;
+            $'\n' | ';')
+                return 0
+                ;;
+            '&')
+                return 0
+                ;;
+            '|')
+                return 0
+                ;;
+            '(' | ')')
+                return 0
+                ;;
+            '<' | '>')
+                next="${input:i+1:1}"
+                [ "$next" = "(" ] && return 0
+                ;;
+        esac
+    done
+
+    return 1
+}
+
+# Sanitize sensitive values for logging
+# Usage: sanitize_log_value "value" "field_name"
+sanitize_log_value() {
+    local value="$1"
+    local field_name="${2:-}"
+
+    # Check if value is empty
+    if [ -z "$value" ]; then
+        echo "$value"
+        return 0
+    fi
+
+    value="$(printf '%s' "$value" | tr '\r\n' '  ')"
+    value="$(printf '%s' "$value" | LC_ALL=C tr -d '\000-\010\013\014\016-\037\177')"
+    value="$(printf '%s' "$value" | sed -E \
+        -e 's/apk_[A-Za-z0-9_-]+/[REDACTED_APORT_KEY]/g' \
+        -e 's/aprt_[A-Za-z0-9_-]+/[REDACTED_APORT_KEY]/g' \
+        -e 's/github_pat_[A-Za-z0-9_]+/[REDACTED_GITHUB_TOKEN]/g' \
+        -e 's/gh[pousr]_[A-Za-z0-9_]+/[REDACTED_GITHUB_TOKEN]/g' \
+        -e 's/xox[baprs]-[A-Za-z0-9-]+/[REDACTED_SLACK_TOKEN]/g' \
+        -e 's/AKIA[0-9A-Z]{16}/[REDACTED_AWS_KEY]/g' \
+        -e 's/(Authorization: Bearer|Authorization:|Bearer) +[A-Za-z0-9._~+\/=-]+/\1 [REDACTED]/g' \
+        -e 's/(password|passwd|pwd|token|secret|api[_-]?key)=([^[:space:]]+)/\1=[REDACTED]/g' \
+        -e 's/-----BEGIN [A-Z ]*PRIVATE KEY-----[^-]*-----END [A-Z ]*PRIVATE KEY-----/[REDACTED_PRIVATE_KEY]/g')"
+
+    # Check for remaining API key patterns (sk_, pk_)
+    if echo "$value" | grep -qE '^(sk_|pk_)'; then
+        echo "${value:0:4}****"
+        return 0
+    fi
+
+    # Check if field name indicates sensitive data
+    if echo "$field_name" | grep -qiE '(password|passwd|pwd|secret|token|key|api)'; then
+        echo "[REDACTED]"
+        return 0
+    fi
+
+    # Truncate very long values (max 200 chars)
+    if [ ${#value} -gt 200 ]; then
+        echo "${value:0:200}..."
+        return 0
+    fi
+
+    echo "$value"
+}
+
+# Normalize a context object for the hosted verify API. The hosted schema for system.command.execute.v1 accepts
+# `shell` only as one of bash, sh, zsh, fish, powershell, cmd. Hooks build the context from harness payloads, where
+# the shell is often absent (empty string) or a path (/bin/bash); both were rejected with HTTP 400
+# context_validation_failed and surfaced to the agent as oap.evaluation_error. Trust decisions about the override
+# are made earlier by aport_hook_shell_override_is_trusted; this only shapes what the API sees.
+# Shape a hook-built context to the hosted verify API's schema. Keyed on the resolved policy id, so every tool
+# that maps to the command policy (bash, terminal, run_terminal_cmd, execute_command, ...) gets the same shaping.
+# The API accepts `shell` only from a fixed enum; anything else is dropped rather than rejected with HTTP 400.
+normalize_api_context() {
+    local policy_id="${1:-}"
+    local context_json="${2:-{\}}"
+    if ! command -v jq > /dev/null 2>&1; then
+        printf '%s' "$context_json"
+        return 0
+    fi
+    case "$policy_id" in
+        system.command.execute*)
+            printf '%s' "$context_json" | jq -c '
+              if (.shell | type) == "string" then
+                (.shell |= (split("/") | last))
+                | if (.shell | IN("bash", "sh", "zsh", "fish", "powershell", "cmd")) then . else del(.shell) end
+              else del(.shell) end
+            ' 2> /dev/null || printf '%s' "$context_json"
+            ;;
+        agent.session.create*)
+            local session_user_id=""
+            session_user_id="${APORT_USER_ID:-${APORT_TARGET_USER:-}}"
+            if [[ -z "$session_user_id" && "${APORT_GUARDRAIL_MODE:-}" = "api" && -n "${APORT_AGENT_ID:-}" ]]; then
+                session_user_id="$APORT_AGENT_ID"
+            fi
+            if [[ -z "$session_user_id" && -n "${PASSPORT_FILE:-}" && -r "${PASSPORT_FILE:-}" ]]; then
+                session_user_id="$(jq -r '(.owner_id // .agent_id // .passport_id // "") | select(type == "string")' "$PASSPORT_FILE" 2> /dev/null || true)"
+            fi
+            if [[ -z "$session_user_id" ]]; then
+                session_user_id="${APORT_OWNER_EMAIL:-${APORT_EMAIL:-${APORT_AGENT_ID:-${USER:-${LOGNAME:-}}}}}"
+            fi
+            session_user_id="$(printf '%s' "$session_user_id" | LC_ALL=C tr -d '\000-\037\177' | head -c 200)"
+            printf '%s' "$context_json" | jq -c --arg user_id "$session_user_id" '
+              def valid_session_type:
+                type == "string" and IN("interactive", "batch", "webhook", "scheduled", "ephemeral");
+              . as $ctx
+              | (if (($ctx.user_id // "") | type) == "string" and (($ctx.user_id // "") | length) > 0 then .
+                 elif $user_id != "" then . + {user_id: $user_id}
+                 else .
+                 end)
+              | (if (.session_type | valid_session_type) then .
+                 elif ((.session_type // "") | type) == "string" and ((.session_type // "") | length) > 0 then .
+                 elif ((.session_operation // "") == "scheduled") then . + {session_type: "scheduled"}
+                 else . + {session_type: "interactive"}
+                 end)
+            ' 2> /dev/null || printf '%s' "$context_json"
+            ;;
+        *)
+            printf '%s' "$context_json"
+            ;;
+    esac
+}

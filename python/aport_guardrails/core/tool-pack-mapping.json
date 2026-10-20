@@ -1,0 +1,157 @@
+{
+  "default": "system.command.execute.v1",
+  "rules": [
+    {
+      "prefixes": ["release.", "repo.release.", "git.release"],
+      "substrings": ["release.publish", "release.create", "npm publish", "pnpm publish", "yarn npm publish", "gh release create"],
+      "pack": "code.release.publish.v1"
+    },
+    { "prefixes": ["git."], "pack": "code.repository.merge.v1" },
+    {
+      "prefixes": [
+        "exec.",
+        "system.",
+        "bash",
+        "shell",
+        "command",
+        "run_terminal_cmd",
+        "runterminalcmd",
+        "run_command",
+        "execute_command",
+        "terminal",
+        "terminal_command",
+        "gateway",
+        "process",
+        "powershell",
+        "monitor"
+      ],
+      "pack": "system.command.execute.v1"
+    },
+    {
+      "prefixes": ["message.", "messaging.", "sms", "whatsapp", "slack", "email"],
+      "pack": "messaging.message.send.v1"
+    },
+    {
+      "prefixes": [
+        "mcp.",
+        "read_mcp_resource",
+        "readmcpresource",
+        "read_mcp_resource_tool",
+        "readmcpresourcetool",
+        "list_mcp_resources",
+        "listmcpresources",
+        "list_mcp_resource_templates",
+        "listmcpresourcetemplates"
+      ],
+      "pack": "mcp.tool.execute.v1"
+    },
+    {
+      "prefixes": [
+        "agent.session.",
+        "session.",
+        "sessions.",
+        "sessions_spawn",
+        "sessions_send",
+        "sessions_yield",
+        "subagents",
+        "session_status",
+        "croncreate",
+        "crondelete",
+        "taskcreate",
+        "taskupdate",
+        "taskstop",
+        "subagent",
+        "subagentstart",
+        "skill",
+        "enterworktree",
+        "exitworktree",
+        "sendmessage",
+        "teamcreate",
+        "teamdelete",
+        "remotetrigger",
+        "schedulewakeup"
+      ],
+      "pack": "agent.session.create.v1"
+    },
+    { "prefixes": ["agent.tool."], "substrings": ["tool.register"], "pack": "agent.tool.register.v1" },
+    { "prefixes": ["agent"], "pack": "agent.session.create.v1" },
+    { "substrings": ["payment.refund", "finance.payment.refund"], "pack": "finance.payment.refund.v1" },
+    { "substrings": ["payment.charge", "finance.payment.charge"], "pack": "finance.payment.charge.v1" },
+    { "prefixes": ["database.", "data.export"], "pack": "data.export.create.v1" },
+    {
+      "prefixes": [
+        "write_file",
+        "edit_file",
+        "create_file",
+        "delete_file",
+        "remove_file",
+        "str_replace",
+        "strreplace",
+        "search_replace",
+        "write",
+        "edit",
+        "multiedit",
+        "notebookedit",
+        "file.write",
+        "file.edit",
+        "data.file.write",
+        "shareonboardingguide"
+      ],
+      "pack": "data.file.write.v1"
+    },
+    {
+      "prefixes": [
+        "read_file",
+        "grep_search",
+        "file_search",
+        "codebase_search",
+        "list_dir",
+        "ls",
+        "present_file",
+        "presentfile",
+        "view_image",
+        "viewimage",
+        "view",
+        "sessions_list",
+        "sessions_history",
+        "cronlist",
+        "read",
+        "glob",
+        "grep",
+        "lsp",
+        "file.read",
+        "data.file.read",
+        "listmcpresourcestool",
+        "readmcpresourcetool",
+        "toolsearch",
+        "waitformcpservers"
+      ],
+      "pack": "data.file.read.v1"
+    },
+    {
+      "prefixes": [
+        "image_gen.",
+        "image_genimagegen",
+        "image.generate",
+        "image_generation",
+        "image_generate",
+        "imagegeneration",
+        "imagegen"
+      ],
+      "pack": "media.image.generate.v1"
+    },
+    {
+      "prefixes": [
+        "web_search",
+        "web_fetch",
+        "websearch",
+        "image_search",
+        "webfetch",
+        "web.search",
+        "web.fetch"
+      ],
+      "pack": "web.fetch.v1"
+    },
+    { "prefixes": ["browser", "web.browser"], "pack": "web.browser.v1" }
+  ]
+}

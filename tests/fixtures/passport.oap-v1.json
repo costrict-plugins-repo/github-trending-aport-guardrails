@@ -1,0 +1,76 @@
+{
+  "passport_id": "CDE60F4E-49DC-4D97-AC05-190E693C202C",
+  "kind": "template",
+  "spec_version": "oap/1.0",
+  "owner_id": "user@example.com",
+  "owner_type": "user",
+  "assurance_level": "L2",
+  "status": "active",
+  "capabilities": [
+    {"id": "repo.pr.create"},
+    {"id": "repo.merge"},
+    {"id": "system.command.execute"},
+    {"id": "data.file.read"},
+    {"id": "data.file.write"},
+    {"id": "web.fetch"},
+    {"id": "media.image.generate"},
+    {"id": "web.browser"},
+    {"id": "agent.session.create"},
+    {"id": "mcp.tool.execute"}
+  ],
+  "limits": {
+    "code.repository.merge": {
+      "max_prs_per_day": 10,
+      "max_merges_per_day": 5,
+      "max_pr_size_kb": 500,
+      "allowed_repos": ["*"],
+      "allowed_base_branches": ["*"],
+      "require_review": false
+    },
+    "system.command.execute": {
+      "allowed_commands": ["mkdir", "ls", "bash", "npm", "git", "node", "pnpm"],
+      "blocked_patterns": ["rm -rf", "sudo"]
+    },
+    "data.file.read": {
+      "allowed_paths": ["*"],
+      "max_file_size_mb": 100
+    },
+    "data.file.write": {
+      "allowed_paths": ["*"],
+      "max_file_size_mb": 50
+    },
+    "web.fetch": {
+      "allowed_domains": ["*"],
+      "blocked_domains": [],
+      "max_requests_per_min": 60
+    },
+    "media.image.generate": {
+      "allowed_providers": ["*"],
+      "max_prompt_length": 8000,
+      "max_referenced_images": 0,
+      "max_output_images": 4,
+      "allowed_output_formats": ["png", "jpg", "jpeg", "webp"]
+    },
+    "web.browser": {
+      "allowed_domains": ["*"],
+      "max_screenshots_per_hour": 100
+    },
+    "agent.session.create": {
+      "max_concurrent": 10
+    },
+    "mcp.tool.execute": {
+      "allowed_servers": ["*"]
+    }
+  },
+  "regions": ["US", "CA"],
+  "metadata": {
+    "name": "Test Agent",
+    "description": "OAP v1.0 test fixture",
+    "version": "1.0.0",
+    "created_by": "tests/fixtures"
+  },
+  "never_expires": true,
+  "created_at": "2026-02-14T22:29:53Z",
+  "updated_at": "2026-02-14T22:29:53Z",
+  "version": "1.0.0"
+}

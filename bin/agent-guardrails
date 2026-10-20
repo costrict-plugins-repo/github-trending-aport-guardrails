@@ -1,0 +1,297 @@
+#!/usr/bin/env bash
+# Main dispatcher: detect or prompt for framework, then run framework setup.
+# Usage:
+#   agent-guardrails                    # detect runtime framework or prompt
+#   agent-guardrails github             # generate GitHub Repository Guard workflow
+#   agent-guardrails openclaw           # explicit framework
+#   agent-guardrails openclaw ap_xxx    # openclaw with agent_id (pass-through)
+#   agent-guardrails --framework=langchain
+#   agent-guardrails -f crewai
+# Supported frameworks: openclaw | langchain | crewai | cursor | claude-code | codex | gemini-cli | goose | deerflow | n8n
+# Gated target: opencode (command explains why setup is not enabled yet)
+# Aliases: claude -> claude-code, gemini -> gemini-cli
+# Project setup target: github
+#
+# Backward compatibility: All arguments after the framework are passed through to
+# the framework script. For OpenClaw, bin/openclaw receives them (e.g. agent_id).
+# The "aport" bin still points at bin/openclaw directly for existing scripts.
+
+set -euo pipefail
+
+# Resolve script path so npx (node_modules/.bin/agent-guardrails -> package/bin/agent-guardrails) works
+SCRIPT_PATH="${BASH_SOURCE[0]:-.}"
+while [[ -L "$SCRIPT_PATH" ]]; do
+  TARGET="$(readlink "$SCRIPT_PATH")"
+  if [[ "$TARGET" == /* ]]; then
+    SCRIPT_PATH="$TARGET"
+  else
+    SCRIPT_PATH="$(cd "$(dirname "$SCRIPT_PATH")" && pwd)/$TARGET"
+  fi
+done
+SCRIPT_DIR="$(cd "$(dirname "$SCRIPT_PATH")" && pwd)"
+ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+FRAMEWORKS_DIR="$SCRIPT_DIR/frameworks"
+LIB_DIR="$SCRIPT_DIR/lib"
+# shellcheck source=lib/config.sh
+source "$LIB_DIR/config.sh"
+SUPPORTED_FRAMEWORKS=("${APORT_SUPPORTED_FRAMEWORKS[@]}")
+reset_requested=""
+
+canonical_framework_name() {
+  local candidate="${1:-}"
+  candidate="$(printf '%s' "$candidate" | tr '[:upper:]' '[:lower:]')"
+  case "$candidate" in
+  claude) printf 'claude-code' ;;
+  gemini) printf 'gemini-cli' ;;
+  *) printf '%s' "$candidate" ;;
+  esac
+}
+
+framework_supported() {
+  local candidate="${1:-}"
+  local supported
+  candidate="$(canonical_framework_name "$candidate")"
+  for supported in "${SUPPORTED_FRAMEWORKS[@]}"; do
+    if [[ "$candidate" == "$supported" ]]; then
+      return 0
+    fi
+  done
+  return 1
+}
+
+# Parse --framework= and -f (skip detection when set)
+framework=""
+integration_mode=""
+noninteractive_requested=""
+REST=()
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --framework=*)
+      framework="${1#--framework=}"
+      shift
+      ;;
+    -f)
+      if [[ $# -gt 1 ]]; then
+        framework="$2"
+        shift 2
+      else
+        echo "[aport] ERROR: -f requires a value (e.g. -f openclaw)" >&2
+        exit 1
+      fi
+      ;;
+    --integration-mode=*)
+      integration_mode="${1#--integration-mode=}"
+      shift
+      ;;
+    --integration-mode)
+      if [[ $# -gt 1 ]]; then
+        integration_mode="$2"
+        shift 2
+      else
+        echo "[aport] ERROR: --integration-mode requires a value (compat or native)" >&2
+        exit 1
+      fi
+      ;;
+    --non-interactive|--noninteractive)
+      noninteractive_requested="1"
+      shift
+      ;;
+    *)
+      REST+=("$1")
+      shift
+      ;;
+  esac
+done
+
+if [[ -n "$noninteractive_requested" ]]; then
+  export APORT_NONINTERACTIVE=1
+fi
+
+if [[ -z "$framework" ]] && [[ ${#REST[@]} -gt 0 ]] && { [[ "${REST[0]}" == "mode" ]] || [[ "${REST[0]}" == "set-mode" ]]; }; then
+  mode_script="$SCRIPT_DIR/aport-set-mode.sh"
+  if [[ ! -x "$mode_script" ]]; then
+    echo "[aport] ERROR: Mode helper not found: $mode_script" >&2
+    exit 1
+  fi
+  exec "$mode_script" "${REST[@]:1}"
+fi
+
+# Project-level setup target. Keep this out of framework auto-detection so the
+# existing runtime framework flow and prompts remain unchanged.
+if [[ -z "$framework" ]] && [[ ${#REST[@]} -gt 0 ]] && [[ "${REST[0]}" == "github" ]]; then
+  github_script="$SCRIPT_DIR/github.sh"
+  if [[ ! -x "$github_script" ]]; then
+    echo "[aport] ERROR: GitHub setup helper not found: $github_script" >&2
+    exit 1
+  fi
+  echo "[aport] Selected target: github" >&2
+  exec "$github_script" "${REST[@]:1}"
+fi
+
+# If no framework from args, check if first REST argument is a framework name
+if [[ -z "$framework" ]] && [[ ${#REST[@]} -gt 0 ]]; then
+  first_arg="${REST[0]}"
+  if [[ "$first_arg" == "reset" ]] && [[ ${#REST[@]} -gt 1 ]]; then
+    second_arg="${REST[1]}"
+    if framework_supported "$second_arg"; then
+      framework="$second_arg"
+      reset_requested="1"
+      REST=("${REST[@]:2}")
+    fi
+  fi
+fi
+
+if [[ -z "$framework" ]] && [[ ${#REST[@]} -gt 0 ]]; then
+  first_arg="${REST[0]}"
+  # Check if first arg looks like a framework name (lowercase alphanumeric + hyphen)
+  if [[ "$first_arg" =~ ^[a-z0-9-]+$ ]]; then
+    if framework_supported "$first_arg"; then
+      framework="$first_arg"
+      # Remove framework from REST so remaining args are pass-through
+      REST=("${REST[@]:1}")
+    fi
+  fi
+fi
+
+if [[ -n "$framework" ]] && [[ ${#REST[@]} -gt 0 ]] && [[ "${REST[0]}" == "reset" ]]; then
+  reset_requested="1"
+  REST=("${REST[@]:1}")
+fi
+
+# If still no framework from args, try APORT_FRAMEWORK (non-interactive) or detection
+if [[ -z "$framework" ]]; then
+  if [[ -n "${APORT_FRAMEWORK:-}" ]]; then
+    framework="$APORT_FRAMEWORK"
+  else
+    project_dir="${APORT_PROJECT_DIR:-$PWD}"
+    if [[ -f "$LIB_DIR/detect.sh" ]]; then
+      # shellcheck source=./lib/detect.sh
+      source "$LIB_DIR/detect.sh"
+      detected_list="$(detect_frameworks_list "$project_dir")"
+      framework="$(detect_framework "$project_dir")"
+      # Multiple detected: show conflict and all options
+      if [[ -n "$detected_list" ]]; then
+        count=$(echo "$detected_list" | wc -w)
+        if [[ "$count" -gt 1 ]]; then
+          noninteractive="${APORT_NONINTERACTIVE:-${CI:-}}"
+          if [[ -n "$noninteractive" ]]; then
+            echo "[aport] ERROR: Multiple frameworks detected: $detected_list" >&2
+            echo "  Set APORT_FRAMEWORK or use --framework=openclaw | langchain | crewai | cursor | claude-code | codex | gemini-cli | goose | deerflow | n8n" >&2
+            echo "  For repository protection, run: npx @aporthq/aport-agent-guardrails github" >&2
+            exit 1
+          fi
+          echo ""
+          echo "  APort Agent Guardrails — Framework setup"
+          echo "  ─────────────────────────────────────────"
+          echo "  Multiple frameworks detected: $detected_list"
+          echo "  Choose one: openclaw | langchain | crewai | cursor | claude-code | codex | gemini-cli | goose | deerflow | n8n"
+          echo "  Example: npx @aporthq/aport-agent-guardrails --framework=openclaw"
+          echo ""
+          read -p "  Framework [${framework:-openclaw}]: " choice
+          framework="${choice:-${framework:-openclaw}}"
+        fi
+      fi
+    fi
+  fi
+fi
+
+# If still empty, prompt or exit (non-interactive)
+if [[ -z "$framework" ]]; then
+  noninteractive="${APORT_NONINTERACTIVE:-${CI:-}}"
+  if [[ -n "$noninteractive" ]]; then
+    echo "[aport] ERROR: No framework detected in current directory." >&2
+    echo "  Set APORT_FRAMEWORK or use --framework=openclaw | langchain | crewai | cursor | claude-code | codex | gemini-cli | goose | deerflow | n8n" >&2
+    exit 1
+  fi
+  echo ""
+  echo "  APort Agent Guardrails — Framework setup"
+  echo "  ─────────────────────────────────────────"
+  echo "  No framework detected in current directory."
+  prompt_default="openclaw"
+  project_dir="${APORT_PROJECT_DIR:-$PWD}"
+  if command -v git > /dev/null 2>&1 && git -C "$project_dir" rev-parse --is-inside-work-tree > /dev/null 2>&1; then
+    prompt_default="github"
+  fi
+  echo "  Choose: github | openclaw | langchain | crewai | cursor | claude-code | codex | gemini-cli | goose | deerflow | n8n"
+  echo "  Example: npx @aporthq/aport-agent-guardrails github"
+  echo "           npx @aporthq/aport-agent-guardrails claude-code"
+  echo "           npx @aporthq/aport-agent-guardrails --framework=langchain"
+  echo ""
+  read -p "  Target [$prompt_default]: " framework
+  framework="${framework:-$prompt_default}"
+fi
+
+framework="$(canonical_framework_name "$framework")"
+
+if [[ "$framework" == "github" ]]; then
+  github_script="$SCRIPT_DIR/github.sh"
+  if [[ ! -x "$github_script" ]]; then
+    echo "[aport] ERROR: GitHub setup helper not found: $github_script" >&2
+    exit 1
+  fi
+  echo "[aport] Selected target: github" >&2
+  exec "$github_script" ${REST+"${REST[@]}"}
+fi
+
+# SECURITY: Validate framework name (alphanumeric + hyphen only, prevents path traversal)
+if [[ ! "$framework" =~ ^[a-z0-9-]+$ ]]; then
+  echo "[aport] ERROR: Invalid framework name: $framework (alphanumeric and hyphens only)" >&2
+  exit 1
+fi
+
+if ! framework_supported "$framework"; then
+  echo "[aport] ERROR: Unknown or unsupported framework: $framework" >&2
+  echo "  Supported: ${SUPPORTED_FRAMEWORKS[*]}" >&2
+  exit 1
+fi
+
+echo "[aport] Selected framework: $framework" >&2
+
+if [[ -n "$reset_requested" ]]; then
+  reset_script="$SCRIPT_DIR/aport-reset-framework.sh"
+  if [[ ! -x "$reset_script" ]]; then
+    echo "[aport] ERROR: Reset helper not found: $reset_script" >&2
+    exit 1
+  fi
+  exec "$reset_script" "$framework" ${REST+"${REST[@]}"}
+fi
+
+if [[ -n "$integration_mode" ]]; then
+  case "$integration_mode" in
+    compat|native) ;;
+    *)
+      echo "[aport] ERROR: Unsupported integration mode: $integration_mode (expected compat or native)" >&2
+      exit 1
+      ;;
+  esac
+  if [[ "$framework" != "crewai" ]]; then
+    echo "[aport] ERROR: --integration-mode is only supported for CrewAI" >&2
+    exit 1
+  fi
+  REST+=("--integration-mode=$integration_mode")
+fi
+
+script="$FRAMEWORKS_DIR/${framework}.sh"
+
+# n8n: custom node not yet available; warn before running wizard-only script
+if [[ "$framework" == "n8n" ]]; then
+  echo "[aport] Note: n8n custom node is not yet available. This setup only runs the passport wizard and writes config." >&2
+fi
+
+# Run framework-specific script if it exists (cursor, claude-code have custom logic)
+if [[ -x "$script" ]]; then
+  exec "$script" ${REST+"${REST[@]}"}
+fi
+
+# Fallback: OpenClaw uses the full installer (wizard + config + plugin + next steps)
+if [[ "$framework" == "openclaw" ]]; then
+  exec "$SCRIPT_DIR/openclaw" ${REST+"${REST[@]}"}
+fi
+
+# Generic handler: works for any framework with a next-steps.d/<framework>.txt data file
+# (crewai, langchain, deerflow, n8n, and any future framework)
+generic_script="$FRAMEWORKS_DIR/generic.sh"
+if [[ -x "$generic_script" ]]; then
+  export APORT_FRAMEWORK="$framework"
+  exec "$generic_script" ${REST+"${REST[@]}"}
+fi

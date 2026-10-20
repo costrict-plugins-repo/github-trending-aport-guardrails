@@ -1,0 +1,7 @@
+# False positives - code comments and documentation
+
+# Line 311: Comment explaining Bearer token regex pattern (not actual token)
+python/aport_guardrails/core/validation.py:bearer-token:311
+
+# Line 29: Documentation text about "secret exfiltration" (not actual secret)
+docs/APORT_AGENT_GUARDRAILS_NAMING.md:generic-secret:29

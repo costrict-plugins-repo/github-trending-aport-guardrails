@@ -1,0 +1,973 @@
+#!/bin/bash
+# OpenClaw + APort: interactive setup
+# Works from a repo checkout or from the published npm package via npx.
+# One run secures OpenClaw: creates a passport or wires a hosted agent_id,
+# installs the APort plugin, writes config, and installs guardrail wrappers.
+# After setup, start OpenClaw with the generated config (e.g. --config ~/.openclaw/config.yaml).
+#
+# Usage: ./bin/openclaw [agent_id]
+#   agent_id (optional): Hosted passport ID from aport.io (e.g., ap_abc123...)
+#
+# Naming: This script has no .sh extension so it can be invoked as a single
+# command (e.g. make openclaw-setup → openclaw). Binaries/entrypoints are
+# typically named without extension (e.g. git, npm); .sh is for library scripts.
+
+set -e
+
+# Resolve REPO_ROOT: follow symlinks so npx (node_modules/.bin/agent-guardrails -> package/bin/openclaw) works
+SCRIPT_PATH="${BASH_SOURCE[0]}"
+while [ -L "$SCRIPT_PATH" ]; do
+	TARGET="$(readlink "$SCRIPT_PATH")"
+	if [[ "$TARGET" == /* ]]; then
+		SCRIPT_PATH="$TARGET"
+	else
+		SCRIPT_PATH="$(cd "$(dirname "$SCRIPT_PATH")" && pwd)/$TARGET"
+	fi
+done
+SCRIPT_DIR="$(cd "$(dirname "$SCRIPT_PATH")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+
+# shellcheck source=lib/guardrail-mode.sh
+source "$SCRIPT_DIR/lib/guardrail-mode.sh"
+# shellcheck source=lib/config.sh
+source "$SCRIPT_DIR/lib/config.sh"
+# shellcheck source=lib/quick-hosted.sh
+source "$SCRIPT_DIR/lib/quick-hosted.sh"
+
+APORT_PLUGIN_PATH="$REPO_ROOT/extensions/openclaw-aport"
+DEFAULT_CONFIG="$(get_config_dir openclaw)"
+
+is_noninteractive() {
+	[ -n "${APORT_NONINTERACTIVE:-${CI:-}}" ]
+}
+
+prompt_with_default() {
+	local __var="$1"
+	local prompt="$2"
+	local default="$3"
+	local input=""
+
+	if is_noninteractive; then
+		printf -v "$__var" '%s' "$default"
+		return 0
+	fi
+
+	read -r -p "$prompt" input || input=""
+	printf -v "$__var" '%s' "${input:-$default}"
+}
+
+read_local_plugin_version() {
+	if ! command -v node >/dev/null 2>&1; then
+		return 0
+	fi
+	local package_json="$APORT_PLUGIN_PATH/package.json"
+	if [ ! -f "$package_json" ]; then
+		return 0
+	fi
+	node -e '
+const fs = require("node:fs");
+try {
+  const pkg = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
+  if (pkg && typeof pkg.version === "string") process.stdout.write(pkg.version);
+} catch {}
+' "$package_json"
+}
+
+read_installed_plugin_version() {
+	if ! command -v openclaw >/dev/null 2>&1 || ! command -v node >/dev/null 2>&1; then
+		return 0
+	fi
+	openclaw plugins list --json 2>/dev/null | node -e '
+let raw = "";
+process.stdin.on("data", (chunk) => {
+  raw += chunk;
+});
+process.stdin.on("end", () => {
+  const jsonStart = raw.indexOf("{");
+  if (jsonStart < 0) return;
+  try {
+    const data = JSON.parse(raw.slice(jsonStart));
+    const plugin = Array.isArray(data.plugins)
+      ? data.plugins.find((entry) => entry && entry.id === "openclaw-aport")
+      : null;
+    if (plugin && typeof plugin.version === "string") {
+      process.stdout.write(plugin.version);
+    }
+  } catch {}
+});
+'
+}
+
+# Parse command line arguments
+HOSTED_AGENT_ID=""
+parse_guardrail_mode_args "$@"
+if [ -n "${APORT_HOSTED_AGENT_ID_CLI:-}" ]; then
+	HOSTED_AGENT_ID="$APORT_HOSTED_AGENT_ID_CLI"
+fi
+CONFIGURED_API_URL="${APORT_GUARDRAIL_API_URL_CLI:-${APORT_API_URL:-$DEFAULT_APORT_API_URL}}"
+if [ "${#APORT_FRAMEWORK_ARGS[@]}" -gt 0 ]; then
+	set -- "${APORT_FRAMEWORK_ARGS[@]}"
+else
+	set --
+fi
+if [ -n "${1:-}" ]; then
+	# Handle help flags
+	if [[ "$1" == "--help" || "$1" == "-h" ]]; then
+		echo "Usage: $0 [agent_id]"
+		echo ""
+		echo "Interactive setup for APort + OpenClaw integration."
+		echo ""
+		echo "Arguments:"
+		echo "  agent_id    Optional hosted passport ID from aport.io (e.g., ap_abc123...)"
+		echo "              If provided, uses hosted passport; otherwise runs passport wizard."
+		echo ""
+		echo "Examples:"
+		echo "  $0                                    # Local passport (wizard)"
+		echo "  $0 ap_fa2f6d53bb5b4c98b9af0124285b6e0f   # Hosted passport"
+		echo ""
+		echo "See: https://github.com/aporthq/aport-agent-guardrails/tree/main/docs"
+		exit 0
+	fi
+	# Validate agent_id format.
+	if [[ "$1" =~ ^(ap|apt|agt_inst|agt_tmpl)_[A-Za-z0-9_-]+$ ]]; then
+		HOSTED_AGENT_ID="$1"
+	else
+		echo "❌ Invalid agent_id format: $1"
+		echo "   Expected: ap_..., apt_..., agt_inst_..., or agt_tmpl_..."
+		echo "   Example: ap_fa2f6d53bb5b4c98b9af0124285b6e0f"
+		echo ""
+		echo "Run '$0 --help' for usage information."
+		exit 1
+	fi
+fi
+
+echo ""
+echo "  🛡️  APort + OpenClaw Setup"
+echo "  ═══════════════════════════"
+echo ""
+
+if [ -n "$HOSTED_AGENT_ID" ]; then
+	echo "  ✅ Using hosted passport"
+	echo "     Agent ID: $HOSTED_AGENT_ID"
+	echo "     Your passport will be fetched from APort API on every call."
+	echo ""
+	echo "  This will:"
+	echo "    1. Choose where to store your OpenClaw config"
+	echo "    2. Install APort OpenClaw plugin (deterministic enforcement)"
+	echo "    3. Install skill wrappers and the APort skill for OpenClaw"
+	echo "    4. Show tool → policy pack mapping"
+	echo ""
+else
+	echo "  This will:"
+	echo "    1. Choose where to store your OpenClaw config (passport, decisions, audit)"
+	echo "    2. Run the passport wizard (OAP v1.0)"
+	echo "    3. Install APort OpenClaw plugin (deterministic enforcement)"
+	echo "    4. Install skill wrappers and the APort skill for OpenClaw"
+	echo "    5. Show tool → policy pack mapping"
+	echo ""
+fi
+
+# 1. OpenClaw config directory
+echo "  📁 OpenClaw config directory"
+echo "     Default: $DEFAULT_CONFIG"
+echo "     (Enter = default; or full path e.g. /Users/you/project/.openclaw or relative e.g. ../my-project)"
+echo ""
+prompt_with_default CONFIG_DIR "  Config directory [$DEFAULT_CONFIG]: " "$DEFAULT_CONFIG"
+CONFIG_DIR="${CONFIG_DIR/#\~/$HOME}"
+# Resolve to absolute path
+if [ "${CONFIG_DIR#/}" = "$CONFIG_DIR" ]; then
+	# No leading / or ~: treat as relative, but fix common mistake (pasted path missing leading /)
+	first_seg="${CONFIG_DIR%%/*}"
+	case "$(echo "$first_seg" | tr 'A-Z' 'a-z')" in
+	users | home) CONFIG_DIR="/$CONFIG_DIR" ;;
+	*) CONFIG_DIR="$PWD/$CONFIG_DIR" ;;
+	esac
+fi
+# Fix duplicated path (e.g. .../aport-agent-guardrails/Users/uchi/... -> /Users/uchi/...)
+if echo "$CONFIG_DIR" | grep -q '/Users/'; then
+	CONFIG_DIR=$(echo "$CONFIG_DIR" | sed 's|.*/Users/|/Users/|')
+elif echo "$CONFIG_DIR" | grep -q '/home/'; then
+	CONFIG_DIR=$(echo "$CONFIG_DIR" | sed 's|.*/home/|/home/|')
+fi
+mkdir -p "$CONFIG_DIR"
+CONFIG_DIR="$(cd "$CONFIG_DIR" && pwd)"
+
+# APort data: passport, decision, audit in config_dir/aport/ (passport status = source of truth for suspend)
+APORT_DIR="$CONFIG_DIR/aport"
+mkdir -p "$APORT_DIR"
+
+echo ""
+echo "  ✓ Using: $CONFIG_DIR"
+echo ""
+
+# 2. Passport setup (hosted or local)
+# Resolve passport path: prefer aport/, fallback to config root (legacy)
+if [ -f "$APORT_DIR/passport.json" ]; then
+	PASSPORT_FILE="$APORT_DIR/passport.json"
+elif [ -f "$CONFIG_DIR/passport.json" ]; then
+	PASSPORT_FILE="$CONFIG_DIR/passport.json"
+else
+	PASSPORT_FILE="$APORT_DIR/passport.json"
+fi
+export APORT_CONFIG_DIR="$CONFIG_DIR"
+export OPENCLAW_CONFIG_DIR="$CONFIG_DIR"
+USE_HOSTED_PASSPORT=false
+
+run_local_passport_wizard() {
+	APORT_FRAMEWORK=openclaw "$REPO_ROOT/bin/aport-create-passport.sh" --output "$PASSPORT_FILE" --framework=openclaw
+}
+
+if [ -n "$HOSTED_AGENT_ID" ]; then
+	# Agent ID provided via command line - use hosted passport
+	echo "  📋 Passport: Hosted (agent_id: $HOSTED_AGENT_ID)"
+	echo "     Skipping local passport creation."
+	echo ""
+	USE_HOSTED_PASSPORT=true
+elif aport_maybe_configure_hosted_passport "openclaw" "$CONFIG_DIR"; then
+	HOSTED_AGENT_ID="$APORT_AGENT_ID"
+	USE_HOSTED_PASSPORT=true
+	echo "  ✅ Using hosted passport (agent_id: $HOSTED_AGENT_ID)"
+	echo ""
+elif [ -n "${APORT_PASSPORT_REUSED:-}" ]; then
+	echo "  ✅ Using passport reused from ${APORT_PASSPORT_REUSED_FROM:-another framework}"
+	echo ""
+elif [ -f "$PASSPORT_FILE" ]; then
+	echo "  📋 Passport: Existing local ($PASSPORT_FILE)"
+	echo "     Continuing without creating a new passport."
+	echo ""
+else
+	run_local_passport_wizard
+fi
+
+# A passport reused from another framework arrives during the block above: the local file lands in
+# $APORT_DIR, and a hosted one may carry that framework's API URL. Re-resolve both so the plugin config, the
+# mode file and the verification run use the reused passport, not the values fixed before the block ran.
+if [ -f "$APORT_DIR/passport.json" ]; then
+	PASSPORT_FILE="$APORT_DIR/passport.json"
+fi
+if [ -z "${APORT_GUARDRAIL_API_URL_CLI:-}" ] && [ -n "${APORT_API_URL:-}" ]; then
+	CONFIGURED_API_URL="$APORT_API_URL"
+fi
+
+# 3. Install OpenClaw Plugin (Deterministic Enforcement)
+echo ""
+echo "  🔌 OpenClaw Plugin Installation"
+echo "  ════════════════════════════════"
+echo ""
+echo "  The APort OpenClaw plugin provides DETERMINISTIC policy enforcement:"
+echo "    ✅ Platform enforces policy before EVERY tool execution"
+echo "    ✅ AI cannot bypass - enforcement happens at platform level"
+echo "    ✅ Fail-closed by default - blocks on error"
+echo ""
+echo "  Compare this to AGENTS.md (best-effort only):"
+echo "    ⚠️  AI follows prompts to call guardrail"
+echo "    ⚠️  Can be bypassed via prompt injection"
+echo "    ⚠️  Not deterministic"
+echo ""
+
+PLUGIN_INSTALLED=false
+if true; then
+	# Check if openclaw CLI is available
+	if ! command -v openclaw &>/dev/null; then
+		echo ""
+		echo "  ⚠️  OpenClaw CLI not found in PATH"
+		echo "     The plugin will be configured, but you'll need to install it manually:"
+		echo "     openclaw plugins install --link $APORT_PLUGIN_PATH"
+		echo ""
+		prompt_with_default continue_anyway "  Continue anyway? [Y/n]: " "y"
+		if [ "$continue_anyway" != "y" ] && [ "$continue_anyway" != "Y" ]; then
+			echo "  Skipping plugin installation."
+		fi
+	else
+		LOCAL_PLUGIN_VERSION="$(read_local_plugin_version)"
+		INSTALLED_PLUGIN_VERSION="$(read_installed_plugin_version)"
+		echo ""
+		if [ -n "$LOCAL_PLUGIN_VERSION" ] && [ "$LOCAL_PLUGIN_VERSION" = "$INSTALLED_PLUGIN_VERSION" ]; then
+			echo "  ✅ Plugin version $LOCAL_PLUGIN_VERSION already installed; skipping reinstall."
+			PLUGIN_INSTALLED=true
+		else
+			if [ -n "$INSTALLED_PLUGIN_VERSION" ]; then
+				echo "  Existing openclaw-aport version: $INSTALLED_PLUGIN_VERSION"
+			fi
+			echo "  Installing plugin from: $APORT_PLUGIN_PATH"
+			echo "  (Using --link to link the local plugin directory.)"
+			if openclaw plugins install --link "$APORT_PLUGIN_PATH" 2>&1; then
+				echo "  ✅ Plugin installed successfully"
+				PLUGIN_INSTALLED=true
+			else
+				echo "  ❌ Plugin installation failed."
+				echo "     OpenClaw did not accept the plugin bundle, so setup is stopping here"
+				echo "     instead of writing plugin config that points at a broken install."
+				echo "     Retry after fixing the bundle or install it manually:"
+				echo "     openclaw plugins install --link $APORT_PLUGIN_PATH"
+				exit 1
+			fi
+		fi
+		echo ""
+
+		# Verify installation
+		if [ "$PLUGIN_INSTALLED" = true ]; then
+			if openclaw plugins list 2>/dev/null | grep -q "openclaw-aport"; then
+				echo "  ✅ Plugin verified in plugins list"
+			else
+				echo "  ⚠️  Plugin installed but not showing in 'openclaw plugins list'"
+			fi
+			echo ""
+			export APORT_CONFIG_DIR="$CONFIG_DIR"
+			export OPENCLAW_CONFIG_DIR="$CONFIG_DIR"
+			# Restart only works when gateway is already running; else start in background.
+			# Never let gateway start/restart fail the APort installation.
+			if openclaw gateway restart 2>/dev/null; then
+				echo "  ✅ Gateway restarted; plugin is active."
+			else
+				# Gateway was not running; start it in background so setup completes without blocking.
+				# Any failure here must not break APort installation (no exit 1).
+				mkdir -p "$CONFIG_DIR/logs" 2>/dev/null || true
+				(APORT_CONFIG_DIR="$CONFIG_DIR" OPENCLAW_CONFIG_DIR="$CONFIG_DIR" nohup openclaw gateway start >>"$CONFIG_DIR/logs/gateway.log" 2>&1 &) 2>/dev/null || true
+				sleep 2
+				if openclaw gateway probe 2>/dev/null; then
+					echo "  ✅ Gateway started in background; plugin is active."
+					echo "     Dashboard: http://127.0.0.1:18789/"
+				else
+					echo "  ⚠️  Gateway start was initiated; it may still be starting."
+					echo "     If the dashboard is unreachable, run: openclaw doctor"
+					echo "     Then start in a terminal: openclaw gateway start"
+				fi
+			fi
+		fi
+	fi
+
+	# Generate plugin configuration
+	echo ""
+	echo "  📝 Generating plugin configuration..."
+	CONFIG_YAML="$CONFIG_DIR/config.yaml"
+
+	# Ask for mode (skip for hosted passport - must use API)
+	if [ "$USE_HOSTED_PASSPORT" = true ]; then
+		PLUGIN_MODE="api"
+		echo ""
+		echo "  Plugin mode: api (required for hosted passport)"
+		prompt_with_default api_url "  APort API URL [$CONFIGURED_API_URL]: " "$CONFIGURED_API_URL"
+	elif [ -n "${APORT_GUARDRAIL_MODE_CLI:-${APORT_GUARDRAIL_MODE:-}}" ]; then
+		select_guardrail_mode "openclaw" ""
+		PLUGIN_MODE="$APORT_SELECTED_GUARDRAIL_MODE"
+		echo ""
+		echo "  Plugin mode: $PLUGIN_MODE (from configured mode)"
+		if [ "$PLUGIN_MODE" = "api" ]; then
+			select_guardrail_api_url "$PLUGIN_MODE"
+			api_url="$APORT_SELECTED_API_URL"
+		fi
+	else
+		echo ""
+		echo "  Plugin mode:"
+		echo "    1. local  - Use local guardrail script (privacy, offline)"
+		echo "    2. api    - Use APort cloud API (default; for traction and cloud features)"
+		echo ""
+		prompt_with_default mode_choice "  Mode [1=local, 2=api]: " "2"
+
+		if [ "$mode_choice" = "2" ]; then
+			PLUGIN_MODE="api"
+			echo ""
+			prompt_with_default api_url "  APort API URL [$CONFIGURED_API_URL]: " "$CONFIGURED_API_URL"
+		else
+			PLUGIN_MODE="local"
+		fi
+	fi
+
+	echo ""
+	echo "  Unmapped tools are blocked by default. Allowing unmapped tools is useful for exploration, but weakens fail-closed enforcement."
+	prompt_with_default allow_unmapped_choice "  Allow unmapped tools? [y/N]: " "n"
+	if [ "$allow_unmapped_choice" = "y" ] || [ "$allow_unmapped_choice" = "Y" ]; then
+		ALLOW_UNMAPPED="true"
+	else
+		ALLOW_UNMAPPED="false"
+	fi
+
+	select_guardrail_enforcement
+	PLUGIN_ENFORCEMENT="$APORT_SELECTED_ENFORCEMENT"
+	MODE_FILE="$(write_guardrail_mode_file "$CONFIG_DIR" "$PLUGIN_MODE" "${api_url:-$CONFIGURED_API_URL}" "$HOSTED_AGENT_ID" "$PLUGIN_ENFORCEMENT")"
+	echo ""
+	echo "  Enforcement: $PLUGIN_ENFORCEMENT"
+	echo "  Mode config:  $MODE_FILE"
+
+	# Create or update config.yaml
+	if [ ! -f "$CONFIG_YAML" ]; then
+		cat >"$CONFIG_YAML" <<YAML
+# OpenClaw Configuration
+# Generated by APort setup script
+
+plugins:
+  enabled: true
+  entries:
+    openclaw-aport:
+      enabled: true
+      config:
+        # Mode: "local" (use guardrail script) or "api" (use APort cloud API)
+        mode: $PLUGIN_MODE
+YAML
+
+		# Add passport configuration (hosted = agentId only, local = passportFile)
+		if [ "$USE_HOSTED_PASSPORT" = true ]; then
+			cat >>"$CONFIG_YAML" <<YAML
+
+        # Hosted passport (agent_id only - no local file)
+        agentId: $HOSTED_AGENT_ID
+YAML
+			if [ -n "${APORT_API_KEY:-}" ]; then
+				cat >>"$CONFIG_YAML" <<YAML
+        apiKey: $APORT_API_KEY
+YAML
+			fi
+		else
+			cat >>"$CONFIG_YAML" <<YAML
+
+        # Passport file location (in aport/ subdir)
+        passportFile: $PASSPORT_FILE
+
+        # Legacy compatibility field; current plugin versions use the built-in JS local evaluator
+        guardrailScript: $CONFIG_DIR/.skills/aport-guardrail-bash.sh
+YAML
+		fi
+
+		if [ "$PLUGIN_MODE" = "api" ]; then
+			cat >>"$CONFIG_YAML" <<YAML
+
+        # For API mode: APort API endpoint
+        apiUrl: $api_url
+YAML
+		fi
+
+		cat >>"$CONFIG_YAML" <<YAML
+
+        # Fail-closed: block on error (default: true)
+        failClosed: true
+
+        # Enforcement: "enforce" blocks, "warn" records completed policy denials,
+        # "observe" warns without blocking on APort mapping/runtime/API failures
+        enforcementMode: $PLUGIN_ENFORCEMENT
+
+        # Allow unmapped tools (false = strict: block custom skills/ClawHub unless mapped)
+        allowUnmappedTools: $ALLOW_UNMAPPED
+YAML
+
+		echo "  ✅ Created $CONFIG_YAML"
+	else
+		# Config exists - check if plugin section already present
+		if grep -q "openclaw-aport:" "$CONFIG_YAML" 2>/dev/null; then
+			api_url_val="${api_url:-$CONFIGURED_API_URL}"
+			if command -v node >/dev/null 2>&1 &&
+				APORT_YAML_MODE="$PLUGIN_MODE" \
+					APORT_YAML_USE_HOSTED="$USE_HOSTED_PASSPORT" \
+					APORT_YAML_AGENT_ID="$HOSTED_AGENT_ID" \
+					APORT_YAML_API_KEY="${APORT_API_KEY:-}" \
+					APORT_YAML_API_URL="$api_url_val" \
+					APORT_YAML_PASSPORT_FILE="$PASSPORT_FILE" \
+					APORT_YAML_GUARDRAIL_SCRIPT="$CONFIG_DIR/.skills/aport-guardrail-bash.sh" \
+					APORT_YAML_ALLOW_UNMAPPED="$ALLOW_UNMAPPED" \
+					APORT_YAML_ENFORCEMENT="$PLUGIN_ENFORCEMENT" \
+					node - "$CONFIG_YAML" <<'NODE'; then
+const fs = require("node:fs");
+const file = process.argv[2];
+const input = fs.readFileSync(file, "utf8");
+const lines = input.split(/\n/);
+const start = lines.findIndex((line) => /^\s*openclaw-aport:\s*$/.test(line));
+if (start < 0) process.exit(2);
+const indent = (lines[start].match(/^\s*/) || [""])[0];
+let end = start + 1;
+for (; end < lines.length; end += 1) {
+  const line = lines[end];
+  if (!line.trim()) continue;
+  const currentIndent = (line.match(/^\s*/) || [""])[0].length;
+  if (currentIndent <= indent.length) break;
+}
+const q = (value) => JSON.stringify(String(value || ""));
+const mode = process.env.APORT_YAML_MODE || "api";
+const hosted = process.env.APORT_YAML_USE_HOSTED === "true";
+const readConfigValue = (key) => {
+  const pattern = new RegExp(`^${indent}    ${key}:\\s*(.*)$`);
+  for (let i = start + 1; i < end; i += 1) {
+    const match = lines[i].match(pattern);
+    if (match) return match[1].trim();
+  }
+  return "";
+};
+const readScalar = (value) => {
+  const raw = String(value || "").trim();
+  if (!raw) return "";
+  try {
+    const parsed = JSON.parse(raw);
+    return parsed == null ? "" : String(parsed);
+  } catch {
+    return raw.replace(/^['"]|['"]$/g, "");
+  }
+};
+const apiKey = process.env.APORT_YAML_API_KEY || readScalar(readConfigValue("apiKey"));
+const block = [
+  `${indent}openclaw-aport:`,
+  `${indent}  enabled: true`,
+  `${indent}  config:`,
+  `${indent}    mode: ${q(mode)}`,
+];
+if (hosted) {
+  block.push(`${indent}    agentId: ${q(process.env.APORT_YAML_AGENT_ID)}`);
+  if (apiKey) {
+    block.push(`${indent}    apiKey: ${q(apiKey)}`);
+  }
+} else {
+  block.push(`${indent}    passportFile: ${q(process.env.APORT_YAML_PASSPORT_FILE)}`);
+  block.push(`${indent}    guardrailScript: ${q(process.env.APORT_YAML_GUARDRAIL_SCRIPT)}`);
+}
+if (mode === "api") {
+  block.push(`${indent}    apiUrl: ${q(process.env.APORT_YAML_API_URL)}`);
+}
+block.push(`${indent}    failClosed: true`);
+block.push(`${indent}    enforcementMode: ${q(process.env.APORT_YAML_ENFORCEMENT || "enforce")}`);
+block.push(`${indent}    allowUnmappedTools: ${process.env.APORT_YAML_ALLOW_UNMAPPED === "true" ? "true" : "false"}`);
+const mapExecToPolicy = readConfigValue("mapExecToPolicy");
+if (mapExecToPolicy) {
+  block.push(`${indent}    mapExecToPolicy: ${mapExecToPolicy}`);
+}
+lines.splice(start, end - start, ...block);
+fs.writeFileSync(file, lines.join("\n"), "utf8");
+NODE
+				echo "  ✅ Updated plugin configuration in $CONFIG_YAML"
+			else
+				echo "  ⚠️  Plugin configuration already present in $CONFIG_YAML, but automatic update failed."
+				echo "     Verify mode, agentId/passportFile, apiUrl, and allowUnmappedTools before starting OpenClaw."
+			fi
+		elif grep -qE '^[[:space:]]*plugins:[[:space:]]*$' "$CONFIG_YAML" 2>/dev/null; then
+			# Safety: avoid writing a duplicate top-level "plugins:" key in existing YAML.
+			# Without a YAML-aware merger (yq), provide a merge-ready snippet instead.
+			APORT_SNIPPET="$CONFIG_DIR/aport-plugin-config.snippet.yaml"
+			{
+				echo "  entries:"
+				echo "    openclaw-aport:"
+				echo "      enabled: true"
+				echo "      config:"
+				echo "        mode: $PLUGIN_MODE"
+				if [ "$USE_HOSTED_PASSPORT" = true ]; then
+					echo "        agentId: $HOSTED_AGENT_ID"
+					[ -n "${APORT_API_KEY:-}" ] && echo "        apiKey: $APORT_API_KEY"
+				else
+					echo "        passportFile: $PASSPORT_FILE"
+					echo "        guardrailScript: $CONFIG_DIR/.skills/aport-guardrail-bash.sh"
+				fi
+				if [ "$PLUGIN_MODE" = "api" ]; then
+					echo "        apiUrl: $api_url"
+				fi
+				echo "        failClosed: true"
+				echo "        enforcementMode: $PLUGIN_ENFORCEMENT"
+				echo "        allowUnmappedTools: $ALLOW_UNMAPPED"
+			} >"$APORT_SNIPPET"
+			echo "  ⚠️  Existing plugins block detected in $CONFIG_YAML; skipped raw append to avoid duplicate YAML keys."
+			echo "     Merge this snippet under your existing plugins block:"
+			echo "     $APORT_SNIPPET"
+		else
+			echo "" >>"$CONFIG_YAML"
+			echo "# APort Plugin Configuration" >>"$CONFIG_YAML"
+			echo "plugins:" >>"$CONFIG_YAML"
+			echo "  enabled: true" >>"$CONFIG_YAML"
+			echo "  entries:" >>"$CONFIG_YAML"
+			echo "    openclaw-aport:" >>"$CONFIG_YAML"
+			echo "      enabled: true" >>"$CONFIG_YAML"
+			echo "      config:" >>"$CONFIG_YAML"
+			echo "        mode: $PLUGIN_MODE" >>"$CONFIG_YAML"
+
+			# Add passport configuration (hosted or local)
+			if [ "$USE_HOSTED_PASSPORT" = true ]; then
+				echo "        agentId: $HOSTED_AGENT_ID" >>"$CONFIG_YAML"
+				[ -n "${APORT_API_KEY:-}" ] && echo "        apiKey: $APORT_API_KEY" >>"$CONFIG_YAML"
+			else
+				echo "        passportFile: $PASSPORT_FILE" >>"$CONFIG_YAML"
+				echo "        guardrailScript: $CONFIG_DIR/.skills/aport-guardrail-bash.sh" >>"$CONFIG_YAML"
+			fi
+
+			if [ "$PLUGIN_MODE" = "api" ]; then
+				echo "        apiUrl: $api_url" >>"$CONFIG_YAML"
+			fi
+
+			echo "        failClosed: true" >>"$CONFIG_YAML"
+			echo "        enforcementMode: $PLUGIN_ENFORCEMENT" >>"$CONFIG_YAML"
+			echo "        allowUnmappedTools: $ALLOW_UNMAPPED" >>"$CONFIG_YAML"
+			echo "  ✅ Appended plugin configuration to $CONFIG_YAML"
+		fi
+	fi
+
+	# Backup a file before overwriting (creates .bak); defined here before first use
+	backup_file() {
+		local f="$1"
+		[ -f "$f" ] && cp "$f" "${f}.bak"
+	}
+
+	# So the default config (openclaw.json) has plugin mode/apiUrl - gateway often loads it, not config.yaml
+	OPENCLAW_JSON="$CONFIG_DIR/openclaw.json"
+	if [ -f "$OPENCLAW_JSON" ] && command -v jq &>/dev/null; then
+		api_url_val="${api_url:-$CONFIGURED_API_URL}"
+
+		if [ "$USE_HOSTED_PASSPORT" = true ]; then
+			# Hosted passport config (agentId only)
+			CONFIG_JSON=$(jq -n \
+				--arg mode "$PLUGIN_MODE" \
+				--arg agent_id "$HOSTED_AGENT_ID" \
+				--arg api_key "${APORT_API_KEY:-}" \
+				--arg api_url "$api_url_val" \
+				--arg allow_unmapped "$ALLOW_UNMAPPED" \
+				--arg enforcement "$PLUGIN_ENFORCEMENT" \
+				'{ mode: $mode, agentId: $agent_id, failClosed: true, enforcementMode: $enforcement, allowUnmappedTools: ($allow_unmapped == "true") } + (if $mode == "api" then { apiUrl: $api_url } else {} end) + (if $api_key != "" then { apiKey: $api_key } else {} end)')
+		else
+			# Local passport config (passportFile in aport/)
+			CONFIG_JSON=$(jq -n \
+				--arg mode "$PLUGIN_MODE" \
+				--arg pf "$PASSPORT_FILE" \
+				--arg gs "$CONFIG_DIR/.skills/aport-guardrail-bash.sh" \
+				--arg api_url "$api_url_val" \
+				--arg allow_unmapped "$ALLOW_UNMAPPED" \
+				--arg enforcement "$PLUGIN_ENFORCEMENT" \
+				'{ mode: $mode, passportFile: $pf, guardrailScript: $gs, failClosed: true, enforcementMode: $enforcement, allowUnmappedTools: ($allow_unmapped == "true") } + (if $mode == "api" then { apiUrl: $api_url } else {} end)')
+		fi
+
+		if jq --argjson cfg "$CONFIG_JSON" '
+            .plugins = (.plugins // {}) |
+            .plugins.entries = (.plugins.entries // {}) |
+            .plugins.entries["openclaw-aport"] = ((.plugins.entries["openclaw-aport"] // {}) | .enabled = true | .config = $cfg) |
+            .plugins.installs = (.plugins.installs // {}) |
+            del(.plugins.installs["openclaw-aport"]) |
+            .plugins.load = (.plugins.load // {}) |
+            .plugins.load.paths = ((.plugins.load.paths // []) | map(select((type == "string" and contains("/openclaw-aport")) | not)))
+        ' "$OPENCLAW_JSON" >"$OPENCLAW_JSON.tmp" 2>/dev/null && {
+			backup_file "$OPENCLAW_JSON"
+			mv "$OPENCLAW_JSON.tmp" "$OPENCLAW_JSON"
+		}; then
+			if [ "$USE_HOSTED_PASSPORT" = true ]; then
+				echo "  ✅ Merged plugin config into $OPENCLAW_JSON (mode=$PLUGIN_MODE, hosted passport, allowUnmappedTools=$ALLOW_UNMAPPED)"
+			else
+				echo "  ✅ Merged plugin config into $OPENCLAW_JSON (mode=$PLUGIN_MODE, allowUnmappedTools=$ALLOW_UNMAPPED)"
+			fi
+			echo "  ✅ Removed stale source-linked OpenClaw plugin paths from $OPENCLAW_JSON"
+		fi
+	fi
+	chmod 600 "$CONFIG_YAML" 2>/dev/null || true
+	[ -f "${OPENCLAW_JSON:-}" ] && chmod 600 "$OPENCLAW_JSON" 2>/dev/null || true
+
+	echo ""
+	echo "  ✅ Plugin setup complete!"
+	echo ""
+else
+	echo ""
+	echo "  Skipping plugin installation."
+	echo "  ⚠️  Without the plugin, enforcement relies on AGENTS.md (not deterministic)"
+	echo ""
+fi
+
+# 4. Store repo path and install wrappers
+echo "$REPO_ROOT" >"$CONFIG_DIR/.aport-repo"
+mkdir -p "$CONFIG_DIR/.skills"
+
+write_wrapper() {
+	local name="$1"
+	cat >"$CONFIG_DIR/.skills/$name" <<WRAP
+#!/bin/bash
+CONFIG_DIR="\$(cd "\$(dirname "\${BASH_SOURCE[0]}")/.." && pwd)"
+APORT_REPO_ROOT="\$(cat "\$CONFIG_DIR/.aport-repo" 2>/dev/null)"
+[ -z "\$APORT_REPO_ROOT" ] && { echo "Error: \$CONFIG_DIR/.aport-repo missing. Re-run bin/openclaw from the guardrails repo." >&2; exit 1; }
+if [ -f "\$APORT_REPO_ROOT/bin/lib/guardrail-mode.sh" ]; then
+  . "\$APORT_REPO_ROOT/bin/lib/guardrail-mode.sh"
+  load_guardrail_mode_for_hooks "\$CONFIG_DIR" || exit 2
+fi
+export APORT_CONFIG_DIR="\${APORT_CONFIG_DIR:-\${OPENCLAW_CONFIG_DIR:-\$CONFIG_DIR}}"
+export OPENCLAW_CONFIG_DIR="\$APORT_CONFIG_DIR"
+export APORT_PASSPORT_FILE="\${APORT_PASSPORT_FILE:-\${OPENCLAW_PASSPORT_FILE:-\$CONFIG_DIR/aport/passport.json}}"
+export APORT_DECISION_FILE="\${APORT_DECISION_FILE:-\${OPENCLAW_DECISION_FILE:-\$CONFIG_DIR/aport/decision.json}}"
+export APORT_AUDIT_LOG="\${APORT_AUDIT_LOG:-\${OPENCLAW_AUDIT_LOG:-\$CONFIG_DIR/aport/audit.log}}"
+export OPENCLAW_PASSPORT_FILE="\$APORT_PASSPORT_FILE"
+export OPENCLAW_DECISION_FILE="\$APORT_DECISION_FILE"
+export OPENCLAW_AUDIT_LOG="\$APORT_AUDIT_LOG"
+exec "\$APORT_REPO_ROOT/bin/$name" "\$@"
+WRAP
+	chmod +x "$CONFIG_DIR/.skills/$name"
+}
+
+write_wrapper "aport-guardrail.sh"
+write_wrapper "aport-guardrail-bash.sh"
+write_wrapper "aport-guardrail-api.sh"
+write_wrapper "aport-guardrail-v2.sh"
+write_wrapper "aport-create-passport.sh"
+write_wrapper "aport-status.sh"
+
+echo ""
+echo "  ✅ Wrappers installed in $CONFIG_DIR/.skills/"
+echo "     (They point to this repo and use your config dir for passport/decision/audit.)"
+echo ""
+
+select_smoke_guardrail_script() {
+	if [ "$USE_HOSTED_PASSPORT" = true ] || [ "$PLUGIN_MODE" = "api" ]; then
+		echo "$CONFIG_DIR/.skills/aport-guardrail-api.sh"
+	else
+		echo "$CONFIG_DIR/.skills/aport-guardrail-bash.sh"
+	fi
+}
+
+describe_smoke_guardrail_mode() {
+	if [ "$USE_HOSTED_PASSPORT" = true ]; then
+		echo "API guardrail (hosted passport)"
+	elif [ "$PLUGIN_MODE" = "api" ]; then
+		echo "API guardrail (local passport)"
+	else
+		echo "local guardrail"
+	fi
+}
+
+print_smoke_guardrail_command() {
+	local smoke_script
+	smoke_script="$(select_smoke_guardrail_script)"
+
+	if [ "$USE_HOSTED_PASSPORT" = true ]; then
+		printf 'APORT_AGENT_ID="%s" APORT_API_URL="%s" %s system.command.execute '\''{"command":"node --version"}'\''' \
+			"$HOSTED_AGENT_ID" "${api_url:-$CONFIGURED_API_URL}" "$smoke_script"
+	elif [ "$PLUGIN_MODE" = "api" ]; then
+		printf 'APORT_PASSPORT_FILE="%s" APORT_API_URL="%s" %s system.command.execute '\''{"command":"node --version"}'\''' \
+			"$PASSPORT_FILE" "${api_url:-$CONFIGURED_API_URL}" "$smoke_script"
+	else
+		printf 'APORT_PASSPORT_FILE="%s" %s system.command.execute '\''{"command":"node --version"}'\''' \
+			"$PASSPORT_FILE" "$smoke_script"
+	fi
+}
+
+run_smoke_guardrail_check() {
+	local smoke_script
+	smoke_script="$(select_smoke_guardrail_script)"
+
+	if [ "$USE_HOSTED_PASSPORT" = true ]; then
+		APORT_AGENT_ID="$HOSTED_AGENT_ID" APORT_API_KEY="${APORT_API_KEY:-}" APORT_API_URL="${api_url:-$CONFIGURED_API_URL}" \
+			"$smoke_script" system.command.execute '{"command":"node --version"}'
+	elif [ "$PLUGIN_MODE" = "api" ]; then
+		APORT_PASSPORT_FILE="$PASSPORT_FILE" APORT_API_URL="${api_url:-$CONFIGURED_API_URL}" \
+			"$smoke_script" system.command.execute '{"command":"node --version"}'
+	else
+		APORT_PASSPORT_FILE="$PASSPORT_FILE" \
+			"$smoke_script" system.command.execute '{"command":"node --version"}'
+	fi
+}
+
+# 4b. Normalize passport to OAP spec (spec_version + nested limits) then ensure allowed_commands
+if [ -f "$PASSPORT_FILE" ] && command -v jq &>/dev/null; then
+	# 4b1. Ensure spec_version and nested limits (fix old or malformed passports)
+	# OAP spec: spec_version "oap/1.0", limits per capability e.g. limits["system.command.execute"]
+	NEED_FIX=0
+	if [ "$(jq -r '.spec_version // "missing"' "$PASSPORT_FILE")" != "oap/1.0" ]; then
+		NEED_FIX=1
+	fi
+	if jq -e '.limits.allowed_commands' "$PASSPORT_FILE" &>/dev/null; then
+		NEED_FIX=1
+	fi
+	if [ "$NEED_FIX" = "1" ]; then
+		echo "  📋 Normalizing passport to OAP spec (spec_version oap/1.0, nested limits)..."
+		jq '
+            (.spec_version = (.spec_version // "oap/1.0")) |
+            (if .limits.allowed_commands then
+                .limits["system.command.execute"] = ((.limits["system.command.execute"] // {}) |
+                    .allowed_commands = (.limits.allowed_commands // ["*"]) |
+                    .blocked_patterns = (.limits.blocked_patterns // ["rm -rf", "sudo"]) |
+                    .max_execution_time = (.limits.max_execution_time // 300)) |
+                .limits |= del(.allowed_commands, .blocked_patterns, .max_execution_time)
+            else . end)
+        ' "$PASSPORT_FILE" >"$PASSPORT_FILE.tmp" && {
+			backup_file "$PASSPORT_FILE"
+			mv "$PASSPORT_FILE.tmp" "$PASSPORT_FILE"
+		}
+		echo "  ✅ Passport normalized."
+	fi
+	echo "  📋 Updating passport allowed_commands (default commands: bash, sh, ls, mkdir, npm, …)..."
+	# Default commands so normal exec works; user can add more in passport or via wizard
+	DEFAULT_CMDS='["npm","yarn","git","node","pnpm","npx","bash","sh","mkdir","cp","ls","cat","echo","pwd","mv","touch","which","open"]'
+	if jq -e '.limits["system.command.execute"]' "$PASSPORT_FILE" &>/dev/null; then
+		EXISTING=$(jq -r '.limits["system.command.execute"].allowed_commands // []' "$PASSPORT_FILE")
+		# Keep ["*"] if user chose allow-any in wizard; otherwise merge with default list
+		if echo "$EXISTING" | jq -e 'index("*") != null' &>/dev/null; then
+			MERGED="$EXISTING"
+		else
+			MERGED=$(jq -n \
+				--argjson existing "$EXISTING" \
+				--argjson default "$DEFAULT_CMDS" \
+				'$existing + $default | unique')
+		fi
+		jq --argjson merged "$MERGED" '.limits["system.command.execute"].allowed_commands = $merged' "$PASSPORT_FILE" >"$PASSPORT_FILE.tmp" && {
+			backup_file "$PASSPORT_FILE"
+			mv "$PASSPORT_FILE.tmp" "$PASSPORT_FILE"
+		}
+	else
+		# New nested block: default to ["*"] per README (blocked_patterns still apply)
+		MERGED='["*"]'
+		jq --argjson merged "$MERGED" \
+			'.limits["system.command.execute"] = ((.limits["system.command.execute"] // {}) | .allowed_commands = $merged | .blocked_patterns = (.blocked_patterns // ["rm -rf", "sudo"]) | .max_execution_time = (.max_execution_time // 300))' "$PASSPORT_FILE" >"$PASSPORT_FILE.tmp" && {
+			backup_file "$PASSPORT_FILE"
+			mv "$PASSPORT_FILE.tmp" "$PASSPORT_FILE"
+		}
+	fi
+	echo "  ✅ Passport updated: default commands are in allowed_commands."
+	echo ""
+	echo "  🔍 Self-check: running $(describe_smoke_guardrail_mode) smoke check..."
+	if ! run_smoke_guardrail_check >/dev/null 2>&1; then
+		echo ""
+		echo "  ⚠️  Smoke check did not return ALLOW."
+		echo "     Plugin install and config are still complete."
+		echo "     Check passport limits, API reachability, or run: $CONFIG_DIR/.skills/aport-status.sh"
+		echo ""
+	else
+		echo "  ✅ Guardrail self-check passed (ALLOW)."
+		echo ""
+	fi
+else
+	if [ ! -f "$PASSPORT_FILE" ]; then
+		echo "  ⚠️  No passport found; skip allowlist update. Run the wizard first or re-run with an existing passport."
+	else
+		echo "  ⚠️  jq not found; cannot auto-update passport allowed_commands. Add needed commands to limits.system.command.execute.allowed_commands manually."
+	fi
+	echo ""
+fi
+
+# 3b. Install APort skill so OpenClaw loads it (managed skill: ~/.openclaw/skills)
+#     OpenClaw loads from: workspace/skills, then ~/.openclaw/skills, then bundled
+#     See https://docs.openclaw.ai/tools/skills
+#     Copy from repo so installed skill matches skills/aport-agent-guardrail/SKILL.md (single source of truth)
+SKILL_DIR="$CONFIG_DIR/skills/aport-guardrail"
+REPO_SKILL="$REPO_ROOT/skills/aport-agent-guardrail/SKILL.md"
+mkdir -p "$SKILL_DIR"
+if [ -f "$REPO_SKILL" ]; then
+	cp "$REPO_SKILL" "$SKILL_DIR/SKILL.md"
+else
+	echo "  ⚠️  Repo SKILL.md not found at $REPO_SKILL; skipping skill install." >&2
+fi
+echo "✅ APort skill installed in $CONFIG_DIR/skills/aport-guardrail/"
+echo "   OpenClaw will load it (managed skill). Use it before effectful actions."
+echo
+
+# 4. Tool → policy mapping (how OpenClaw knows which policy pack)
+echo "📋 Tool → policy pack mapping"
+echo "   OpenClaw (or your code) calls the guardrail with a tool name and context."
+echo "   The guardrail maps that to a policy pack in external/aport-policies:"
+echo
+cat <<'TABLE'
+	   Tool name (examples)              → Policy pack
+	   ------------------------------------------------
+	   release.publish, git.release      → code.release.publish.v1
+	   git.create_pr, git.merge, git.*   → code.repository.merge.v1
+	   exec.run, system.command.*        → system.command.execute.v1
+	   message + send/reply/broadcast    → messaging.message.send.v1
+	   message + sendAttachment/react    → messaging.message.send.v1
+	   serverName__toolName, mcp__*      → mcp.tool.execute.v1
+	   read, glob, grep                  → data.file.read.v1
+	   write, edit, multiedit            → data.file.write.v1
+TABLE
+echo "   Plugin mapping source: extensions/openclaw-aport/tool-mapping.js"
+echo "   Unmapped tools are blocked by default; set allowUnmappedTools: true only for explicit exploration/reporting."
+echo
+
+# 5. Enforcement summary
+echo ""
+echo "  🛡️  Enforcement Summary"
+echo "  ═══════════════════════"
+echo ""
+
+if [ "$PLUGIN_INSTALLED" = true ]; then
+	echo "  ✅ DETERMINISTIC ENFORCEMENT: Plugin installed"
+	echo ""
+	echo "     The APort OpenClaw plugin enforces policies at the platform level."
+	echo "     Every tool execution is checked BEFORE running - AI cannot bypass."
+	echo ""
+	echo "     Config: $CONFIG_DIR/config.yaml"
+	echo "     Mode: $PLUGIN_MODE"
+	echo ""
+	echo "     To verify plugin is active:"
+	echo "     openclaw plugins list | grep openclaw-aport"
+	echo ""
+else
+	echo "  ⚠️  BEST-EFFORT ENFORCEMENT: Using AGENTS.md only"
+	echo ""
+	echo "     Without the plugin, enforcement relies on the AI following prompts"
+	echo "     in workspace/AGENTS.md to call the guardrail before actions."
+	echo ""
+	echo "     This is NOT deterministic and can be bypassed."
+	echo ""
+	echo "     To install the plugin later, run:"
+	echo "     openclaw plugins install --link $APORT_PLUGIN_PATH"
+	echo ""
+fi
+
+# 6. Next steps (paths use config dir above)
+echo "📝 Next steps"
+echo "-------------"
+echo "  (Paths below are for this config dir. Re-run setup if you use a different one.)"
+echo ""
+echo "  1. Smoke test – run this (one line); expect Exit: 0 = ALLOW:"
+echo "     (copy the line below as-is; it has your config path)"
+echo "     $(print_smoke_guardrail_command); echo \"Exit: \$? (0=ALLOW, 1=DENY)\""
+echo ""
+
+if [ "$PLUGIN_INSTALLED" = true ]; then
+	echo "  2. Start the gateway (run in a terminal and keep it open):"
+	echo "     openclaw gateway start"
+	echo "     (If the gateway was already running, use: openclaw gateway restart)"
+	echo ""
+	echo "  3. Test plugin enforcement by trying a blocked action"
+	echo "     (The plugin will automatically block based on passport limits)"
+	echo ""
+else
+	echo "  2. In OpenClaw: point skills to the guardrail script:"
+	echo "     $CONFIG_DIR/.skills/aport-guardrail.sh"
+	echo ""
+	echo "  3. Optional – use API (self-hosted or cloud):"
+	echo "     export APORT_API_URL=\"https://api.aport.io\""
+	echo "     $CONFIG_DIR/.skills/aport-guardrail-api.sh system.command.execute '{\"command\":\"node --version\"}'"
+	echo ""
+fi
+# 7. Ensure workspace has APort rule in AGENTS.md (auto-install; no manual merge)
+WORKSPACE_DIR="$CONFIG_DIR/workspace"
+AGENTS="$WORKSPACE_DIR/AGENTS.md"
+mkdir -p "$WORKSPACE_DIR"
+APORT_MARKER="Pre-Action Authorization (APort Guardrails)"
+if [ ! -f "$AGENTS" ]; then
+	cp "$REPO_ROOT/docs/AGENTS.md.example" "$AGENTS"
+	echo "  ✅ Created $AGENTS with APort pre-action rule."
+else
+	if grep -q "$APORT_MARKER" "$AGENTS" 2>/dev/null; then
+		echo "  ✅ APort rule already present in $AGENTS"
+	else
+		echo "" >>"$AGENTS"
+		echo "---" >>"$AGENTS"
+		cat "$REPO_ROOT/docs/AGENTS.md.example" >>"$AGENTS"
+		echo "  ✅ Appended APort pre-action rule to $AGENTS"
+	fi
+fi
+echo ""
+
+if [ "$PLUGIN_INSTALLED" = true ]; then
+	echo "  Note: AGENTS.md is installed for reference, but the plugin provides"
+	echo "        deterministic enforcement (AI cannot bypass). AGENTS.md is optional."
+else
+	echo "  Note: Without the plugin, AGENTS.md is your only enforcement layer."
+	echo "        This relies on the AI following instructions (not deterministic)."
+fi
+
+echo ""
+echo "  View status: $CONFIG_DIR/.skills/aport-status.sh"
+echo ""
+if [ "$USE_HOSTED_PASSPORT" = true ]; then
+	echo "  Running smoke test: $(describe_smoke_guardrail_mode)..."
+	if run_smoke_guardrail_check >/dev/null 2>&1; then
+		echo "  ✅ Smoke test passed (hosted passport, exit 0 = ALLOW)"
+	else
+		echo "  ⚠️  Smoke test skipped or failed (hosted). Ensure API is reachable; plugin will use agentId on each tool call."
+	fi
+else
+	echo "  Running smoke test: $(print_smoke_guardrail_command)"
+	if run_smoke_guardrail_check >/dev/null 2>&1; then
+		echo "  ✅ Smoke test passed (exit 0 = ALLOW)"
+	else
+		echo "  ⚠️  Smoke test denied or failed. Plugin install and config are still complete."
+		echo "     Check passport limits, API reachability, or run: $CONFIG_DIR/.skills/aport-status.sh"
+	fi
+fi
+echo ""
+echo "  Done. OpenClaw config: $CONFIG_DIR"
+echo ""

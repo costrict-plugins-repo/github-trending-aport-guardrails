@@ -1,0 +1,13 @@
+  APort n8n support: setup only. This wrote a passport and config; no APort node is published yet.
+
+  Next steps (n8n):
+  ────────────────
+  1. Prefer a hosted passport (ap_...) so n8n can call the APort verify API directly.
+  2. Wrap each sensitive action in a sub-workflow used as a tool (Call n8n Workflow tool on
+     the AI Agent node, or a workflow tool in the Agent Builder):
+       HTTP Request -> POST https://api.aport.io/api/verify/policy/<pack_id>
+       IF on decision.allow -> action node on the true branch
+  3. Keep the agent ID and API key in n8n credentials, not in workflow JSON.
+  4. For tools a person should sign off on, add n8n's Human review / Approve tool calls too.
+
+  See: docs/frameworks/n8n.md

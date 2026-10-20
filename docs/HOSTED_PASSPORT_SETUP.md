@@ -1,0 +1,403 @@
+# Using Hosted Passports
+
+**For users who created a passport at [aport.io/builder/create](https://aport.io/builder/create)**
+
+---
+
+## Overview
+
+You have two options when using APort guardrails with supported runtime frameworks:
+
+1. **Hosted Passport** (recommended): Create or select a passport in APort → use `agent_id` only, no local passport JSON needed.
+2. **Local Passport**: Create a passport with the CLI wizard → store it in the APort framework state directory.
+
+**Why Hosted?**
+- ✅ **Global Kill Switch**: Suspend passport instantly from dashboard (all agents stop < 15s)
+- ✅ **No JSON Management**: No local file to lose or back up
+- ✅ **Team Sync**: Share policies across team members
+- ✅ **Web Dashboard**: View activity, audit logs, analytics
+- ✅ **Automatic Updates**: Edit limits in dashboard → takes effect immediately
+
+---
+
+## Quick Start (Hosted Passport)
+
+**Step 1: Create Passport at aport.io**
+
+1. Visit [https://aport.io/builder/create](https://aport.io/builder/create)
+2. Select your framework: **Claude Code**, **Cursor**, **OpenClaw**, **LangChain**, **CrewAI**, **DeerFlow**, or **n8n**
+3. Fill agent name and limits, then click "Create Passport"
+4. On the success page you’ll see an **agent_id** (e.g. `ap_abc123def456...`) and often a ready-to-run command.
+
+**Step 2: Install Guardrails**
+
+**Option A — One command:**
+
+```bash
+npx @aporthq/aport-agent-guardrails <framework>
+```
+
+When prompted for passport setup, choose option `1`:
+
+1. `Create hosted APort passport now` — recommended; creates a hosted passport and narrow setup key.
+2. `Use existing hosted passport ID` — paste an existing `agent_id`.
+3. `Create local passport file` — offline/local JSON passport.
+
+The installer creates a passport, creates a narrow setup key, and configures the framework hook/plugin to use hosted verification.
+
+Non-interactive hosted setup uses the same dispatcher:
+
+```bash
+npx --yes @aporthq/aport-agent-guardrails claude-code \
+  --quick-hosted \
+  --email you@example.com \
+  --non-interactive
+```
+
+Use `--api-url https://your-aport.example` for a private APort deployment. Non-interactive setup uses the framework default config directory (or `APORT_<FRAMEWORK>_CONFIG_DIR` when set) and strict mode. For a non-interactive install that writes a local passport file instead of a hosted one, see [QUICKSTART.md](QUICKSTART.md#non-interactive-installs).
+
+If you already have your agent_id, pass it directly:
+
+```bash
+npx @aporthq/aport-agent-guardrails <framework> <agent_id>
+```
+
+Example: `npx @aporthq/aport-agent-guardrails claude-code ap_fa2f6d53bb5b4c98b9af0124285b6e0f`. The CLI skips passport creation and configures the runtime hook to use your hosted passport.
+
+**Option B — Interactive:**
+
+```bash
+npx @aporthq/aport-agent-guardrails
+```
+
+When prompted for passport, create a hosted passport or paste an existing `agent_id`. The config directory defaults to the selected framework's APort directory. API mode is required for hosted passports.
+
+**Step 3: Restart or run the target framework**
+
+- **Claude Code:** restart Claude Code so `~/.claude/settings.json` is loaded.
+- **Cursor:** reload the Cursor window or restart Cursor so `.cursor/hooks.json` is loaded.
+- **OpenClaw:** start or restart the gateway:
+
+  ```bash
+  openclaw gateway start --config ~/.openclaw/config.yaml
+  ```
+
+- **LangChain / CrewAI:** install the Python adapter and register the callback/hook from the framework doc.
+
+**Done.** The installed hook/plugin sends action context to APort Verify and receives an allow/deny decision using the hosted `agent_id`.
+
+---
+
+## How It Works (Hosted Passport)
+
+```
+User → Framework: "Create a file"
+         ↓
+ Framework: Tool call → hook/callback/plugin
+         ↓
+ APort Guardrail: Reads config → sees agent_id (no local passport file)
+         ↓
+ APort Guardrail: POST to api.aport.io/api/verify/policy/system.command.execute.v1
+                  Body: { "context": { "agent_id": "ap_abc123...", "command": "touch test.txt" } }
+         ↓
+    APort API: Fetches passport from registry by agent_id
+         ↓
+    APort API: Evaluates policy → Returns ALLOW/DENY
+         ↓
+ APort Guardrail: ✅ ALLOW → Tool runs
+                 ❌ DENY → Tool blocked
+```
+
+**Key Point:** Your passport stays in APort's registry. The guardrail sends `agent_id` + context, API fetches passport, evaluates policy, returns decision. **No passport file stored locally.**
+
+---
+
+## Configuration (Hosted Passport)
+
+### Option A: During Setup (Automatic)
+
+Run `npx @aporthq/aport-agent-guardrails` and follow prompts. The setup script will create `~/.openclaw/config.yaml`:
+
+```yaml
+plugins:
+  enabled: true
+  entries:
+    openclaw-aport:
+      enabled: true
+      config:
+        mode: api
+        agentId: ap_abc123def456...  # Your hosted passport ID
+        apiUrl: https://api.aport.io
+        failClosed: true
+        enforcementMode: enforce
+        allowUnmappedTools: false
+```
+
+**Note:** When `agentId` is set, the plugin uses it instead of reading `passportFile`.
+
+### Option B: Manual Configuration
+
+If you already have a config, edit `~/.openclaw/config.yaml`:
+
+**Add or replace the APort plugin section:**
+
+```yaml
+plugins:
+  enabled: true
+  entries:
+    openclaw-aport:
+      enabled: true
+      config:
+        # Use API mode (required for hosted passports)
+        mode: api
+
+        # Hosted passport: provide agent_id instead of passportFile
+        agentId: ap_abc123def456...  # REPLACE with your agent_id from aport.io
+
+        # API endpoint
+        apiUrl: https://api.aport.io
+
+        # Optional: API key if your organization requires it
+        # (Set APORT_API_KEY in environment; do NOT put in config file)
+
+        # Fail-closed: block on error (default: true)
+        failClosed: true
+
+        # Fail closed on new/unknown tools unless explicitly relaxed
+        enforcementMode: enforce
+        allowUnmappedTools: false
+```
+
+**Then restart OpenClaw:**
+
+```bash
+openclaw gateway restart
+```
+
+---
+
+## Testing Your Setup
+
+### Test 1: Verify Plugin Loaded
+
+```bash
+openclaw plugins list | grep openclaw-aport
+# Should show: openclaw-aport (enabled)
+```
+
+### Test 2: Try a Safe Command
+
+Ask your OpenClaw agent:
+```
+"Create a directory called test"
+```
+
+**Expected:** ✅ Command allowed, directory created
+
+### Test 3: Try a Dangerous Command
+
+Ask your OpenClaw agent:
+```
+"Run rm -rf /"
+```
+
+**Expected:** ❌ Command blocked with reason: "Blocked pattern: rm -rf"
+
+### Test 4: Check Dashboard
+
+1. Visit [https://aport.io/passports](https://aport.io/passports)
+2. Click your passport
+3. View activity log → Should see recent tool calls (ALLOW/DENY)
+
+---
+
+## Switching Between Local and Hosted
+
+### From Local → Hosted
+
+1. Create hosted passport at aport.io/builder/create
+2. Copy `agent_id`
+3. Edit `~/.openclaw/config.yaml`:
+   ```yaml
+   config:
+     mode: api
+     agentId: ap_your_new_agent_id  # ADD THIS
+     # passportFile: ~/.openclaw/passport.json  # REMOVE OR COMMENT OUT
+     apiUrl: https://api.aport.io
+   ```
+4. Restart: `openclaw gateway restart`
+
+### From Hosted → Local
+
+1. Download passport JSON from dashboard (if available) OR create new local passport:
+   ```bash
+   ./bin/aport-create-passport.sh --output ~/.openclaw/passport.json
+   ```
+2. Edit `~/.openclaw/config.yaml`:
+   ```yaml
+   config:
+     mode: local  # OR api (both work with local file)
+     passportFile: ~/.openclaw/passport.json  # ADD THIS
+     # agentId: ap_...  # REMOVE OR COMMENT OUT
+     guardrailScript: ~/.openclaw/.skills/aport-guardrail-bash.sh
+   ```
+3. Restart: `openclaw gateway restart`
+
+---
+
+## Managing Your Hosted Passport
+
+### Update Limits
+
+1. Visit [https://aport.io/passports](https://aport.io/passports)
+2. Click your passport → "Edit"
+3. Update limits (e.g., change `max_files` from 500 → 1000)
+4. Click "Save"
+5. **Takes effect immediately** (no restart needed)
+
+### Suspend Passport (Kill Switch)
+
+1. Visit passport dashboard
+2. Click "Suspend"
+3. **All agents using this passport stop within 15 seconds**
+4. To resume: Click "Activate"
+
+### View Activity
+
+1. Passport dashboard → "Activity" tab
+2. See all tool calls: timestamp, tool name, decision (ALLOW/DENY), reason
+
+### Download Passport (Backup)
+
+1. Passport dashboard → "Download JSON"
+2. Save to `~/.openclaw/passport.json` (optional local backup)
+
+---
+
+## Troubleshooting
+
+### Error: "Failed to fetch passport from API"
+
+**Cause:** Invalid `agent_id` or API unreachable
+
+**Fix:**
+1. Verify `agent_id` in config matches dashboard (no typos)
+2. Check API reachable: `curl -sf https://api.aport.io/api/status`
+3. If behind firewall, check network access to `api.aport.io`
+
+### Error: "API key required"
+
+**Cause:** Your organization requires authentication
+
+**Fix:**
+1. Get API key from team admin or dashboard
+2. Set in environment (NOT in config):
+   ```bash
+   export APORT_API_KEY="your-api-key-here"
+   openclaw gateway restart
+   ```
+3. For permanent: Add to `~/.bashrc` or `~/.zshrc`
+
+### Plugin Not Checking
+
+**Cause:** Plugin not loaded or config incorrect
+
+**Fix:**
+1. Check plugin enabled: `openclaw plugins list`
+2. Check config: `cat ~/.openclaw/config.yaml | grep -A 10 openclaw-aport`
+3. Check logs: `openclaw logs | grep APort`
+4. Reinstall plugin:
+   ```bash
+   openclaw plugins uninstall openclaw-aport
+   npx @aporthq/aport-agent-guardrails openclaw
+   ```
+
+### Passport Suspended But Agent Still Running
+
+**Cause:** Kill switch delay (< 15s) or API mode not enabled
+
+**Fix:**
+1. Wait 15 seconds (API checks every 10s)
+2. Verify mode is `api` in config (local suspend = set passport `status` to `suspended`; no separate file; same standard as other frameworks)
+3. Force restart: `openclaw gateway restart`
+
+---
+
+## API Mode vs. Local Mode (With Hosted Passport)
+
+| Feature | API Mode (Hosted) | Local Mode |
+|---------|-------------------|------------|
+| **Passport storage** | APort registry | Local file |
+| **agent_id only** | ✅ Yes | ❌ No - needs file |
+| **Global suspend** | ✅ &lt;30s (login, suspend in registry) | Passport `status` only (edit passport; no separate file) |
+| **Network required** | ✅ Yes | ❌ No |
+| **Policy updates** | ✅ Instant | Manual file edit |
+| **Team sync** | ✅ Yes | Manual file sharing |
+| **Audit log** | ✅ Cloud dashboard | Local file only |
+
+**Recommendation:** Use **API mode** with hosted passports for global suspend (login once, suspend in registry; all agents using that passport deny within &lt;30s) and team sync.
+
+---
+
+## Advanced: Self-Hosted API
+
+If you're running the APort API yourself (e.g., on-prem or private cloud):
+
+**Config:**
+```yaml
+config:
+  mode: api
+  agentId: ap_your_agent_id
+  apiUrl: https://your-aport-api.company.com  # YOUR API
+  failClosed: true
+  enforcementMode: enforce
+  allowUnmappedTools: false
+```
+
+**Deploy APort API:**
+1. See [agent-passport repo](https://github.com/aporthq/agent-passport) functions/api
+2. Deploy to Cloudflare Workers, Vercel, or your infra
+3. Point `apiUrl` to your deployed API
+
+---
+
+## FAQ
+
+**Q: Can I use hosted passport with local mode?**
+A: No. Local mode requires a passport file. Use API mode with hosted passports.
+
+**Q: What if API goes down?**
+A: With `failClosed: true` (default), all tool calls are blocked. Set `failClosed: false` to allow on error (NOT RECOMMENDED for security).
+
+**Q: How do I roll out without blocking developers?**
+A: Keep `failClosed: true`, but set `enforcementMode: warn` or run `npx @aporthq/aport-agent-guardrails mode <framework> --enforcement=warn` for conservative report-only rollout. This records completed policy denials while allowing the framework action to continue, but still blocks adapter/runtime/API failures. If the priority is adoption and not blocking developers while mappings or hosted availability are still being tuned, use `--enforcement=observe`; observe mode allows with warnings for policy denials and non-mandatory APort runtime/mapping/API failures. Mandatory prerequisites such as missing `jq` still block. Audit entries require `python3`; unsafe or unavailable audit paths still block with `oap.audit_unavailable` because APort will not allow a tool call without its audit record. Switch back to `--enforcement=enforce` when the passport and mappings are tuned.
+
+Claude Code surfaces warn-mode decisions with a visible `systemMessage`. Cursor returns warning fields as best-effort context but may not display allow warnings in the UI; use the audit log or `bin/aport-status.sh` to inspect report-only decisions.
+
+**Q: Can I create multiple hosted passports?**
+A: Yes! Free tier: 1 passport. Beta/Pro: Unlimited. Each passport has unique `agent_id`.
+
+**Q: How do I migrate from CLI-created to hosted?**
+A: Create hosted passport at aport.io → Update config with `agentId` → Restart. Old local file can stay (ignored when `agentId` set).
+
+**Q: Can I download my hosted passport?**
+A: Yes, dashboard → "Download JSON". But you don't need to - `agent_id` is enough.
+
+---
+
+## Next Steps
+
+- ✅ **Setup complete?** Test with safe + dangerous commands
+- 📖 **Learn more:** [QUICKSTART_OPENCLAW_PLUGIN.md](QUICKSTART_OPENCLAW_PLUGIN.md)
+- 🛠️ **Customize policies:** Edit passport limits in dashboard
+- 👥 **Team setup:** Invite team members at [aport.io/organizations](https://aport.io/organizations)
+- 📊 **Monitor usage:** View activity logs in dashboard
+
+---
+
+## See Also
+
+- [QUICKSTART_OPENCLAW_PLUGIN.md](QUICKSTART_OPENCLAW_PLUGIN.md) - Plugin setup (local passport)
+- [VERIFICATION_METHODS.md](VERIFICATION_METHODS.md) - API vs. local mode comparison
+- [OPENCLAW_TOOLS_AND_POLICIES.md](OPENCLAW_TOOLS_AND_POLICIES.md) - Tool → policy mapping
+- [test-remote-passport-api.sh](../tests/test-remote-passport-api.sh) - Test script for hosted passports

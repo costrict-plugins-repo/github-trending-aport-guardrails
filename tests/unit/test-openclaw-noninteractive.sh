@@ -1,0 +1,265 @@
+#!/bin/bash
+# OpenClaw hosted quick setup must complete without prompts and honor --api-url.
+
+set -e
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+TEST_DIR="${APORT_TEST_DIR:-$(mktemp -d)}"
+FAKE_BIN="$TEST_DIR/bin-openclaw-noninteractive"
+OPENCLAW_HOME="$TEST_DIR/.openclaw-noninteractive"
+LOG_FILE="$TEST_DIR/openclaw.log"
+mkdir -p "$FAKE_BIN" "$OPENCLAW_HOME"
+mkdir -p "$OPENCLAW_HOME/aport"
+printf '{"passport_id":"local-existing"}\n' > "$OPENCLAW_HOME/aport/passport.json"
+
+cat > "$FAKE_BIN/openclaw" << 'EOF'
+#!/bin/bash
+set -e
+case "$*" in
+  "plugins list --json")
+    printf '{"plugins":[{"id":"openclaw-aport","version":"test"}]}'
+    ;;
+  "plugins list")
+    printf 'openclaw-aport test\n'
+    ;;
+  plugins\ install*)
+    exit 0
+    ;;
+  "gateway restart")
+    exit 0
+    ;;
+  "gateway probe")
+    exit 0
+    ;;
+  *)
+    exit 0
+    ;;
+esac
+EOF
+chmod +x "$FAKE_BIN/openclaw"
+
+cat > "$FAKE_BIN/curl" << 'EOF'
+#!/bin/bash
+set -e
+output=""
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    -o)
+      output="$2"
+      shift 2
+      ;;
+    -w)
+      shift 2
+      ;;
+    *)
+      shift
+      ;;
+  esac
+done
+agent_id="${APORT_TEST_ISSUE_AGENT_ID:-ap_1234567890abcdef1234567890abcdef}"
+printf '{"agent_id":"%s","api_key":"apk_runtime_test","api_key_id":"key_runtime"}' "$agent_id" > "$output"
+printf '201'
+EOF
+chmod +x "$FAKE_BIN/curl"
+
+PATH="$FAKE_BIN:$PATH" \
+    OPENCLAW_HOME="$OPENCLAW_HOME" \
+    APORT_NONINTERACTIVE=1 \
+    "$REPO_ROOT/bin/openclaw" \
+    --quick-hosted \
+    --email dev@example.com \
+    --issue-url http://issue.local/api/issue \
+    --api-url http://127.0.0.1:9 \
+    --non-interactive \
+    < /dev/null > "$LOG_FILE" 2>&1 || {
+    echo "FAIL: OpenClaw non-interactive hosted setup failed" >&2
+    cat "$LOG_FILE" >&2
+    exit 1
+}
+
+CONFIG_YAML="$OPENCLAW_HOME/config.yaml"
+[ -f "$CONFIG_YAML" ] || {
+    echo "FAIL: expected OpenClaw config.yaml" >&2
+    cat "$LOG_FILE" >&2
+    exit 1
+}
+
+grep -q '^        agentId: ap_1234567890abcdef1234567890abcdef$' "$CONFIG_YAML" || {
+    echo "FAIL: config.yaml should include hosted agent id" >&2
+    cat "$CONFIG_YAML" >&2
+    exit 1
+}
+
+if grep -q 'passportFile:' "$CONFIG_YAML"; then
+    echo "FAIL: quick-hosted OpenClaw setup should prefer hosted mode over an existing local passport" >&2
+    cat "$CONFIG_YAML" >&2
+    exit 1
+fi
+
+grep -q '^        apiUrl: http://127.0.0.1:9$' "$CONFIG_YAML" || {
+    echo "FAIL: config.yaml should honor --api-url" >&2
+    cat "$CONFIG_YAML" >&2
+    exit 1
+}
+
+grep -q '^        allowUnmappedTools: false$' "$CONFIG_YAML" || {
+    echo "FAIL: non-interactive default should block unmapped tools" >&2
+    cat "$CONFIG_YAML" >&2
+    exit 1
+}
+
+awk '{ print; if ($0 == "        allowUnmappedTools: false") print "        mapExecToPolicy: false" }' "$CONFIG_YAML" > "$CONFIG_YAML.tmp"
+mv "$CONFIG_YAML.tmp" "$CONFIG_YAML"
+
+PATH="$FAKE_BIN:$PATH" \
+    OPENCLAW_HOME="$OPENCLAW_HOME" \
+    APORT_NONINTERACTIVE=1 \
+    APORT_TEST_ISSUE_AGENT_ID="ap_fedcba9876543210fedcba9876543210" \
+    "$REPO_ROOT/bin/openclaw" \
+    --quick-hosted \
+    --email dev@example.com \
+    --issue-url http://issue.local/api/issue \
+    --api-url http://127.0.0.1:10 \
+    --non-interactive \
+    < /dev/null >> "$LOG_FILE" 2>&1 || {
+    echo "FAIL: OpenClaw hosted rerun failed" >&2
+    cat "$LOG_FILE" >&2
+    exit 1
+}
+
+grep -q '^        agentId: "ap_1234567890abcdef1234567890abcdef"$' "$CONFIG_YAML" || {
+    echo "FAIL: quick-hosted rerun should reuse existing hosted passport id" >&2
+    cat "$CONFIG_YAML" >&2
+    exit 1
+}
+
+grep -q '^        apiUrl: "http://127.0.0.1:10"$' "$CONFIG_YAML" || {
+    echo "FAIL: existing config.yaml should update API URL on rerun" >&2
+    cat "$CONFIG_YAML" >&2
+    exit 1
+}
+
+grep -q '^        mapExecToPolicy: false$' "$CONFIG_YAML" || {
+    echo "FAIL: existing config.yaml should preserve mapExecToPolicy on rerun" >&2
+    cat "$CONFIG_YAML" >&2
+    exit 1
+}
+
+grep -q '^        apiKey: "apk_runtime_test"$' "$CONFIG_YAML" || {
+    echo "FAIL: quick-hosted rerun should write the newly issued runtime key" >&2
+    cat "$CONFIG_YAML" >&2
+    exit 1
+}
+
+perl -0pi -e 's/apiKey: "apk_runtime_test"/apiKey: apk_existing_config_key/' "$CONFIG_YAML"
+PATH="$FAKE_BIN:$PATH" \
+    OPENCLAW_HOME="$OPENCLAW_HOME" \
+    APORT_NONINTERACTIVE=1 \
+    "$REPO_ROOT/bin/openclaw" \
+    ap_11111111111111111111111111111111 \
+    --api-url http://127.0.0.1:11 \
+    --non-interactive \
+    < /dev/null >> "$LOG_FILE" 2>&1 || {
+    echo "FAIL: OpenClaw direct hosted rerun failed" >&2
+    cat "$LOG_FILE" >&2
+    exit 1
+}
+
+grep -q '^        agentId: "ap_11111111111111111111111111111111"$' "$CONFIG_YAML" || {
+    echo "FAIL: direct hosted rerun should update hosted agent id" >&2
+    cat "$CONFIG_YAML" >&2
+    exit 1
+}
+
+grep -q '^        apiUrl: "http://127.0.0.1:11"$' "$CONFIG_YAML" || {
+    echo "FAIL: direct hosted rerun should update API URL" >&2
+    cat "$CONFIG_YAML" >&2
+    exit 1
+}
+
+grep -q '^        apiKey: "apk_existing_config_key"$' "$CONFIG_YAML" || {
+    echo "FAIL: existing config.yaml should preserve apiKey on rerun when no replacement is supplied" >&2
+    cat "$CONFIG_YAML" >&2
+    exit 1
+}
+
+OVERRIDE_HOME="$TEST_DIR/.openclaw-home-ignored"
+OVERRIDE_STATE="$TEST_DIR/.openclaw-state-ignored"
+OVERRIDE_CONFIG="$TEST_DIR/.openclaw-config-override"
+mkdir -p "$OVERRIDE_HOME" "$OVERRIDE_STATE" "$OVERRIDE_CONFIG/aport"
+printf '{"passport_id":"override-existing"}\n' > "$OVERRIDE_CONFIG/aport/passport.json"
+PATH="$FAKE_BIN:$PATH" \
+    OPENCLAW_HOME="$OVERRIDE_HOME" \
+    OPENCLAW_STATE_DIR="$OVERRIDE_STATE" \
+    OPENCLAW_CONFIG_DIR="$OVERRIDE_CONFIG" \
+    APORT_NONINTERACTIVE=1 \
+    "$REPO_ROOT/bin/openclaw" \
+    ap_22222222222222222222222222222222 \
+    --api-url http://127.0.0.1:12 \
+    --non-interactive \
+    < /dev/null >> "$LOG_FILE" 2>&1 || {
+    echo "FAIL: OpenClaw OPENCLAW_CONFIG_DIR override setup failed" >&2
+    cat "$LOG_FILE" >&2
+    exit 1
+}
+
+[ -f "$OVERRIDE_CONFIG/config.yaml" ] || {
+    echo "FAIL: OpenClaw installer should write config.yaml under OPENCLAW_CONFIG_DIR" >&2
+    cat "$LOG_FILE" >&2
+    exit 1
+}
+
+if [ -e "$OVERRIDE_STATE/config.yaml" ] || [ -e "$OVERRIDE_HOME/config.yaml" ]; then
+    echo "FAIL: OpenClaw installer should not write to lower-precedence state/home overrides" >&2
+    cat "$LOG_FILE" >&2
+    exit 1
+fi
+
+APORT_OVERRIDE_CONFIG="$TEST_DIR/.openclaw-aport-config-override"
+mkdir -p "$APORT_OVERRIDE_CONFIG/aport"
+printf '{"passport_id":"aport-override-existing"}\n' > "$APORT_OVERRIDE_CONFIG/aport/passport.json"
+PATH="$FAKE_BIN:$PATH" \
+    OPENCLAW_HOME="$OVERRIDE_HOME" \
+    OPENCLAW_STATE_DIR="$OVERRIDE_STATE" \
+    OPENCLAW_CONFIG_DIR="$OVERRIDE_CONFIG" \
+    APORT_OPENCLAW_CONFIG_DIR="$APORT_OVERRIDE_CONFIG" \
+    APORT_NONINTERACTIVE=1 \
+    "$REPO_ROOT/bin/openclaw" \
+    ap_33333333333333333333333333333333 \
+    --api-url http://127.0.0.1:13 \
+    --non-interactive \
+    < /dev/null >> "$LOG_FILE" 2>&1 || {
+    echo "FAIL: OpenClaw APORT_OPENCLAW_CONFIG_DIR override setup failed" >&2
+    cat "$LOG_FILE" >&2
+    exit 1
+}
+
+[ -f "$APORT_OVERRIDE_CONFIG/config.yaml" ] || {
+    echo "FAIL: OpenClaw installer should write config.yaml under APORT_OPENCLAW_CONFIG_DIR" >&2
+    cat "$LOG_FILE" >&2
+    exit 1
+}
+
+grep -Eq '^        agentId: "?ap_33333333333333333333333333333333"?$' "$APORT_OVERRIDE_CONFIG/config.yaml" || {
+    echo "FAIL: APORT_OPENCLAW_CONFIG_DIR config should receive the hosted agent id" >&2
+    cat "$APORT_OVERRIDE_CONFIG/config.yaml" >&2
+    exit 1
+}
+
+cat > "$OPENCLAW_HOME/aport/guardrail-mode.env" << 'EOF'
+APORT_GUARDRAIL_MODE=api
+APORT_API_URL=https://api.aport.io
+UNSAFE=$(touch /tmp/aport-openclaw-wrapper-unsafe)
+EOF
+set +e
+"$OPENCLAW_HOME/.skills/aport-guardrail-bash.sh" system.command.execute '{"command":"ls"}' > "$TEST_DIR/wrapper-mode.out" 2> "$TEST_DIR/wrapper-mode.err"
+WRAPPER_EXIT=$?
+set -e
+if [ "$WRAPPER_EXIT" -ne 2 ]; then
+    echo "FAIL: generated OpenClaw wrapper should stop on invalid guardrail mode file, got $WRAPPER_EXIT" >&2
+    cat "$TEST_DIR/wrapper-mode.out" >&2
+    cat "$TEST_DIR/wrapper-mode.err" >&2
+    exit 1
+fi
+
+echo "OK test-openclaw-noninteractive.sh"

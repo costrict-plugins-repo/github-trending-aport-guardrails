@@ -1,0 +1,22 @@
+  Next steps (CrewAI native provider mode):
+  ───────────────────────────────────────
+  Requires a CrewAI build with native guardrail provider support.
+
+  1. Install the Python runtime package:
+     uv add aport-agent-guardrails
+  2. Config written to: $config_dir
+  3. If your CrewAI build documents a native guardrail-provider hook,
+     wire APort's provider through that hook before running your crew:
+
+     from aport_guardrails.providers import OAPGuardrailProvider
+
+     provider = OAPGuardrailProvider(framework="crewai", config_path="$config_dir/config.yaml")
+
+  Current released CrewAI users should use the compatibility hook adapter:
+     pip install aport-agent-guardrails-crewai
+     aport-crewai setup
+
+  Released CrewAI compatibility mode:
+     rerun without --integration-mode=native
+
+  See: docs/frameworks/crewai.md
